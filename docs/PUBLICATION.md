@@ -1,15 +1,17 @@
 # Publication checklist
 
-Date: 2 November 2026. The local branch `migration/vita-build-244` now also has an asset-free patch on top of the review. Nothing in this checklist was pushed. Public `main` is still `53c4cf8`. History was not rewritten.
+Date: 2 November 2026. The branch `migration/vita-build-244` carries the build 244 overlay and the asset-free patch. History was not rewritten.
 
-The asset-free patch removes `rom/cache/` and `rom/SCC1_Florestan.sf2` from this branch only. Those files remain on `main` and in the parent commits of this branch. `rom/Roboto/NOTICE` names Google as the copyright holder. `rom/config.ini` has an empty password on this branch. The previous password remains in `53c4cf8`.
+The asset-free patch removes `rom/cache/` and `rom/SCC1_Florestan.sf2` from the tip of this branch. Those blobs remain in the parent commits and in `lesleyrs/Client3`. `rom/Roboto/NOTICE` names Google as the copyright holder. `rom/config.ini` has an empty password on this branch. The previous password remains in `53c4cf8`.
+
+Publishing this branch and merging it into `main` was authorized. That does not add a license, and it does not resolve the Client3 redistribution question in [CLIENT3-REDISTRIBUTION.md](CLIENT3-REDISTRIBUTION.md). No VPK is attached.
 
 Working source on this branch is revision 225, build 244. Revision 377 is not in this tree and is not part of this checklist.
 
 ## Ready
 
-- [x] Fork relationship recorded: `me11yb3an/Client3` is a public fork of `lesleyrs/Client3`. `main` is still `53c4cf8`.
-- [x] Build 244 overlay is only on the local migration branch.
+- [x] Fork relationship recorded: `me11yb3an/Client3` is a public fork of `lesleyrs/Client3`. The upstream commit this branch starts from is `53c4cf8`.
+- [x] Build 244 overlay is on `migration/vita-build-244`.
 - [x] `server/NOTICE.md` still carries the Lost City MIT notice, the rsbuf MIT notice, the rsmod-pathfinder ISC notice, and the node-forge BSD notice.
 - [x] Vendored headers still carry their own notices: ini (rxi, MIT), ISAAC (Bob Jenkins, public domain), LibTomMath (Unlicense), stb_image (public domain), TinySoundFont (MIT), micro-bunzip (LGPLv2 header).
 - [x] `provenance/src-tree.rar` contains 335 files: 175 `.h`, 105 `.c`, 55 `.inc`. No image, audio, font, archive, save, package, or key file. A text scan found no private-key header and no token prefix.
@@ -18,7 +20,7 @@ Working source on this branch is revision 225, build 244. Revision 377 is not in
 
 ## Build, not a successful compile
 
-`make -f units.mk -n` parsed `units.mk` and then stopped because `src/r63_search_icon.h` is missing. Exit code 2. The dry run did not compile. `link.sh` passes `bash -n`. The compiler path `/usr/local/vitasdk/bin/arm-vita-eabi-gcc` does not exist on the machine that ran the check.
+`make -f units.mk -n` parsed `units.mk` and then stopped because `src/r63_search_icon.h` is missing. Exit code 2. The dry run did not compile. `link.sh` passes `bash -n`. A later look found VitaSDK 15.2.0 in WSL at `/usr/local/vitasdk`. That did not become a completed compile. The missing headers and link inputs below were not invented.
 
 A later VitaSDK run still needs, from outside this repository:
 
@@ -45,13 +47,13 @@ These five headers embed pixels and are absent on purpose. Do not regenerate the
 
 ## Inherited `rom/`
 
-1,084 files, about 11.6 MB. This branch did not add them. They are in the published fork because `main` is Client3.
+Upstream `main` contained 1,084 `rom/` files, about 11.6 MB. This branch did not add them. Its tip keeps the Roboto fonts and removes the cache and the soundfont. Older commits still have the removed files.
 
 | Path | Contents | License finding | Recommendation |
 | --- | --- | --- | --- |
 | `rom/Roboto/` | 12 `Roboto-*.ttf` files. The name table of `Roboto-Regular.ttf` says Copyright 2011 Google Inc. `LICENSE.txt` is Apache-2.0. | Apache-2.0 applies to these fonts. | Kept. `rom/Roboto/NOTICE` supplies the copyright line the license appendix left blank. |
-| `rom/SCC1_Florestan.sf2` | Florestan Basic GM GS, sampled from a Roland Sound Canvas. | The public-domain label is not settled. | Removed from this branch. The blob remains on `main` and in history. |
-| `rom/cache/` | Cache archives, 828 map files, 182 songs, 48 jingles, and `worldmap.jag`. | No license was found. | Removed from this branch. The blobs remain on `main` and in history. |
+| `rom/SCC1_Florestan.sf2` | Florestan Basic GM GS, sampled from a Roland Sound Canvas. | The public-domain label is not settled. | Removed from this branch's tip. The blob remains in history and in `lesleyrs/Client3`. |
+| `rom/cache/` | Cache archives, 828 map files, 182 songs, 48 jingles, and `worldmap.jag`. | No license was found. | Removed from this branch's tip. The blobs remain in history and in `lesleyrs/Client3`. |
 | `rom/config.ini` | Client options. Upstream stored a username and a password. | The password is a 9-letter token next to the username `shared`. It is the value Client3 already publishes, not a newly found private key. It is still a login password, so this branch stores an empty value. | Cleared on this branch. The old value remains in `53c4cf8`. |
 
 ## What a GitHub fork authorizes
@@ -60,13 +62,13 @@ GitHub's Terms of Service, effective 27 April 2026, section D.5: making a reposi
 
 GitHub's own licensing guidance says that a repository with no license remains under default copyright, and that other people may not reproduce, distribute, or create derivative works from it. The right GitHub documents on top of that is to view the repository and to fork it.
 
-Client3 has no `LICENSE`. Its readme does not grant modification or redistribution. No written grant from its author is in this tree. The fork at `me11yb3an/Client3` is the D.5 copy of upstream. It does not authorize publishing the modified Client3 files on `migration/vita-build-244`, and it does not authorize a repository-wide MIT, GPL, or other license.
+Client3 has no `LICENSE`. Its readme does not grant modification or redistribution. No written grant from its author is in this tree. The fork at `me11yb3an/Client3` is the D.5 copy of upstream. It does not license the modified Client3 files, and it does not authorize a repository-wide MIT, GPL, or other license.
 
-Section D.3 still requires the person who posts content to have the right to post it and to comply with third-party licenses. A fork of Client3-Vita, or the fact that Client3 is already public, is not that right.
+Section D.3 still requires the person who posts content to have the right to post it and to comply with third-party licenses. A fork of Client3-Vita, or the fact that Client3 is already public, is not that right. That question stays open in [CLIENT3-REDISTRIBUTION.md](CLIENT3-REDISTRIBUTION.md). No root license was added to paper over it.
 
-## Decisions required before publishing the Vita branch
+## Still open after publication
 
-1. Obtain a license or a written grant covering the files in [CLIENT3-REDISTRIBUTION.md](CLIENT3-REDISTRIBUTION.md), or leave this branch unpublished.
-2. The cache, music, maps, and Florestan soundfont are gone from this branch and still present on public `main`. Removing them from `main` needs a separate approval. A history rewrite was not done.
-3. Decide how the five image headers and `rom/vita-enhanced.bin` will be supplied on the build machine. The steps are in [BUILD-DEPS.md](BUILD-DEPS.md).
-4. Say explicitly when `migration/vita-build-244` may be pushed. Until then it stays local.
+1. There is still no license or written grant for the files in [CLIENT3-REDISTRIBUTION.md](CLIENT3-REDISTRIBUTION.md). The practical channel is the author of [lesleyrs/Client3](https://github.com/lesleyrs/Client3).
+2. The cache, music, maps, and Florestan soundfont are absent from this tip. They remain in older commits and upstream. History was not rewritten.
+3. The five image headers and `rom/vita-enhanced.bin` still have to be supplied on the build machine. The steps are in [BUILD-DEPS.md](BUILD-DEPS.md).
+4. A downloadable VPK is not part of this publication. [VPK-RELEASE-DRAFT.md](VPK-RELEASE-DRAFT.md) is text only.

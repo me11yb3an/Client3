@@ -19,7 +19,7 @@ build244.mk                       translation units excluded from the Client3 wi
 SOURCE-MANIFEST.json              byte inventory of the export, paths unchanged
 ```
 
-Upstream `rom/`, `sce_sys/`, `vita.mk`, and the other platform makefiles stay where Client3 put them. This branch does not add another `rom/` and does not delete the inherited one.
+Upstream `sce_sys/`, `vita.mk`, and the other platform makefiles stay where Client3 put them. This branch does not add a second `rom/`. Its `rom/` keeps the Roboto fonts, `config.ini`, and `rom/Roboto/NOTICE`, and it does not contain `rom/cache/` or `rom/SCC1_Florestan.sf2`.
 
 `src/offline_vita.c` is the file `units.mk` compiles (`853b5b90`). The export also had `src-tree/offline_vita.c` (`0183d4b3`), which differs by 231 lines. That copy is kept at `provenance/src-tree-offline_vita.c` so the bytes are not dropped. The five `ba_hw_r*.inc` duplicates matched after newline normalization, so the tree keeps one copy under `src/`.
 

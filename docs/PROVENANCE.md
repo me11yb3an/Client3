@@ -64,4 +64,4 @@ On 2 November 2026 the same export was overlaid onto a local clone of `me11yb3an
 
 The root `units.mk` and `link.sh` are the checkpoint scripts with in-repo paths retargeted. `provenance/checkpoint-units.mk` and `provenance/checkpoint-link.sh` are the unmodified bytes. `provenance/src-tree-offline_vita.c` is the export's other `offline_vita.c` (`0183d4b3`). The file `units.mk` compiles is `src/offline_vita.c` (`853b5b90`).
 
-The migration branch has not been pushed. The published fork is still the unmodified Client3 history, which includes upstream `rom/`.
+This branch's tip removes `rom/cache` and `rom/SCC1_Florestan.sf2`. The Roboto fonts stay, with `rom/Roboto/NOTICE`. Older commits and `lesleyrs/Client3` still contain the removed files. No history was rewritten, and no root license was added.
