@@ -3,7 +3,12 @@
 
 #include "loctype.h"
 #include "model.h"
+#include "r99_maze_caps.h"
 #include "platform.h"
+#include "r57_body_layers.h"
+#include "r66_scenery_visuals.h"
+#include "r87_vendor_layers.h"
+#include "r90_sewing_table.h"
 
 LocTypeData _LocType = {0};
 
@@ -17,7 +22,9 @@ static LocType *loctype_new(void) {
 
 void loctype_unpack(Jagfile *config) {
     _LocType.modelCacheStatic = lrucache_new(500);
-    _LocType.modelCacheDynamic = lrucache_new(30*5); // TODO if dynamic cache size isn't big enough it'll leak in allocator
+    // TzHaar compatibility: retain animated states rather than evicting into the non-reclaiming scene pool.
+    // The old150-state cache exhausted32MiB;1024states stabilized the connected city at26,031,720bytes.
+    _LocType.modelCacheDynamic = lrucache_new(1024); // TODO if dynamic cache size isn't big enough it'll leak in allocator
 
     _LocType.dat = jagfile_to_packet(config, "loc.dat");
     Packet *idx = jagfile_to_packet(config, "loc.idx");
@@ -44,6 +51,7 @@ void loctype_free_global(void) {
     lrucache_free(_LocType.modelCacheDynamic);
     free(_LocType.offsets);
     for (int i = 0; i < 10; i++) {
+        loctype_reset(_LocType.cache[i]);
         free(_LocType.cache[i]);
     }
     free(_LocType.cache);
@@ -111,6 +119,7 @@ void loctype_reset(LocType *loc) {
     loc->offsety = 0;
     loc->offsetz = 0;
     loc->forcedecor = false;
+    loc->raiseobject = -1;
 }
 
 static void loctype_decode(LocType *loc, Packet *dat) {
@@ -213,6 +222,8 @@ static void loctype_decode(LocType *loc, Packet *dat) {
             loc->offsetz = g2b(dat);
         } else if (code == 73) {
             loc->forcedecor = true;
+        } else if (code == 75) {
+            loc->raiseobject = g1(dat);
         } else {
             rs2_error("Error unrecognised loc config code: %d\n", code);
         }
@@ -229,6 +240,26 @@ static void loctype_decode(LocType *loc, Packet *dat) {
             loc->active = true;
         }
     }
+}
+
+#include "r21_location_visual.h"
+static int visual_scene_x,visual_scene_z;
+void loctype_set_scene_origin(int x,int z){visual_scene_x=x;visual_scene_z=z;}
+bool loctype_visual_hidden_for_scene(LocType *loc,int level,int x,int z,int shape,int rotation){
+#if defined(__vita__) && defined(BUILD_A_EMBEDDED)
+    return r66_hidden_decoration(loc->index,level,visual_scene_x+x,visual_scene_z+z,shape,rotation)!=0;
+#else
+    (void)loc;(void)level;(void)x;(void)z;(void)shape;(void)rotation;return false;
+#endif
+}
+LocType *loctype_visual_for_scene(LocType *loc,int level,int x,int z,int shape,int rotation){
+#if defined(__vita__) && defined(BUILD_A_EMBEDDED)
+    int id=r21_visual_location_id(loc->index,level,visual_scene_x+x,visual_scene_z+z,shape,rotation);
+    if(id!=loc->index)return loctype_get(id);
+#else
+    (void)level;(void)x;(void)z;(void)shape;(void)rotation;
+#endif
+    return loc;
 }
 
 Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW, int heightmapSE, int heightmapNE, int heightmapNW, int transformId) {
@@ -251,6 +282,8 @@ Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW,
 
     Model *cached = (Model *)lrucache_get(_LocType.modelCacheDynamic, bitset);
     if (cached) {
+        /* Sequenced scenery is redrawn every frame. Keep it out of the static mesh. */
+        if (loc->anim != -1 || transformId != -1) cached->r10_animated = true;
         if (_LocType.reset) {
             return cached;
         }
@@ -284,34 +317,74 @@ Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW,
     }
 
     int modelId = loc->models[shapeIndex];
-    if (modelId == -1) {
-        return NULL;
-    }
-
+    if (modelId == -1) return NULL;
     bool flipped = loc->mirror ^ (rotation > 3);
-    if (flipped) {
-        modelId += 65536;
+    int partCount = 0;
+    for (int i = 0; i < loc->shapes_and_models_count; i++) {
+        if (loc->shapes[i] == shape) partCount++;
     }
-
-    Model *model = (Model *)lrucache_get(_LocType.modelCacheStatic, modelId);
+    // Duplicate shape entries are emitted only for recovered multipart locations.
+    // Keep the original single-model cache key and path for all existing objects.
+    int64_t staticKey = partCount > 1
+        ? ((int64_t)1 << 32) | ((int64_t)loc->index << 1) | flipped
+        : modelId + (flipped ? 65536 : 0);
+    Model *model = (Model *)lrucache_get(_LocType.modelCacheStatic, staticKey);
     if (!model) {
-        model = model_from_id(modelId & 0xffff, true);
-        if (flipped) {
-            model_rotate_y180(model);
+        if (partCount == 1) {
+            model = model_from_id(modelId, true);
+            r99_close_door_trim(model,loc->index,modelId,shape);
+            if (flipped) model_rotate_y180(model);
+        } else {
+            Model *parts[256];
+            int n = 0;
+            for (int i = 0; i < loc->shapes_and_models_count; i++) {
+                if (loc->shapes[i] != shape) continue;
+                int key = loc->models[i] + (flipped ? 65536 : 0);
+                Model *part = (Model *)lrucache_get(_LocType.modelCacheStatic, key);
+                if (!part) {
+                    part = model_from_id(loc->models[i], true);
+                    if (flipped) model_rotate_y180(part);
+                    lrucache_put(_LocType.modelCacheStatic, key, &part->link);
+                }
+                parts[n++] = part;
+            }
+            model = model_from_models(parts, n, true);
         }
-        lrucache_put(_LocType.modelCacheStatic, modelId, &model->link);
+        /* Prepare bind-pose priorities once; pose copies retain the bounded metadata. */
+        if(r66_pole_type(loc->index)&&modelId==3185&&shape==4)r57_prepare_body_layers(model);
+        lrucache_put(_LocType.modelCacheStatic, staticKey, &model->link);
     }
 
+    if((r87_vendor_type(loc->index)||r90_sewing_table_type(loc->index))&&shape==10)r57_prepare_fixture_layers(model,R87_VENDOR_BACKING_TEXTURES);
     bool scaled = loc->resizex != 128 || loc->resizey != 128 || loc->resizez != 128;
     bool translated = loc->offsetx != 0 || loc->offsety != 0 || loc->offsetz != 0;
+    /* A centrepiece whose unrotated back sits on the outer wall plane is buried
+     * in the 16-unit wall. 18 is that thickness plus 2 units of clearance.
+     * The shift is local +X before rotation, so each wall side follows. */
+    bool wall_backed = false;
+    if (shape == CENTREPIECE_STRAIGHT && model->vertex_count > 0) {
+        int min_x = model->vertices_x[0];
+        int max_x = min_x;
+        for (int v = 1; v < model->vertex_count; v++) {
+            int x = model->vertices_x[v];
+            if (x < min_x) min_x = x;
+            if (x > max_x) max_x = x;
+        }
+        wall_backed = min_x <= -64 && max_x <= 16;
+    }
+    bool share_vertices = rotation == 0 && transformId == -1 && !scaled && !translated && !wall_backed;
 
-    Model *modified = model_share_colored(model, !loc->recol_s, !loc->animHasAlpha, rotation == 0 && transformId == -1 && !scaled && !translated, true);
+    Model *modified = model_share_colored(model, !loc->recol_s, !loc->animHasAlpha, share_vertices, true);
     if (transformId != -1) {
         model_create_label_references(modified, false);
         model_apply_transform(modified, transformId);
         model_free_label_references(modified);
         modified->label_faces = NULL;
         modified->label_vertices = NULL;
+    }
+
+    if (wall_backed) {
+        model_translate(modified, 0, 18, 0);
     }
 
     while (rotation-- > 0) {
@@ -333,8 +406,9 @@ Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW,
     }
 
     model_calculate_normals(modified, loc->ambient + 64, loc->contrast * 5 + 768, -50, -10, -50, !loc->sharelight, true);
+    if (loc->anim != -1 || transformId != -1) modified->r10_animated = true;
 
-    if (loc->blockwalk) {
+    if (loc->raiseobject == 1 || (loc->raiseobject == -1 && loc->blockwalk)) {
         modified->obj_raise = modified->max_y;
     }
 
@@ -361,5 +435,6 @@ Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW,
         model_calculate_bounds_y(modified);
     }
 
+    if (loc->anim != -1 || transformId != -1) modified->r10_animated = true;
     return modified;
 }

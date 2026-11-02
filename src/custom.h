@@ -35,3 +35,21 @@ bool inPasswordArea(Client *c);
 bool insideMobileInputArea(Client *c);
 bool insideTabArea(Client *c);
 bool insideViewportArea(Client *c);
+
+
+// Performance text is drawn into the viewport surface, not full-screen space.
+// Translate the existing block uniformly, preserving every line's spacing.
+#if defined(__vita__) && defined(VITA_NATIVE_WIDESCREEN)
+#include "vita_wide_layout.h"
+#define PERF_VIEW_MARGIN 8
+#define PERF_RIGHT(original) (GAME_VIEW_WIDTH - PERF_VIEW_MARGIN)
+#define PERF_BASELINE(original) ((original) - (13 * 4 - (PERF_VIEW_MARGIN + 12)))
+#else
+#define PERF_RIGHT(original) (original)
+#define PERF_BASELINE(original) (original)
+#endif
+
+void draw_info_overlay_local(Client*c,int x,int y);
+
+/* Display-only Classic diagnostics, sampled at four updates per second. */
+const char *classic_perf_display(int slot,const char *text);

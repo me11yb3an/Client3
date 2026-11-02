@@ -1,0 +1,314 @@
+# RuneScape 2 revision #225 (18 May 2004) C99 port
+Portable single-threaded C client for early RS2, the last update before a new cache format and ondemand protocol.
+
+Compatible with [LostCity](https://github.com/LostCityRS/Server), the most accurate runescape remake!
+
+Features:
+- should work on any 32 bit system with 64 MB of RAM on lowmem, networking and a (read-only) filesystem.
+- webassembly build to avoid javascript code being optimized out by the browser.
+- WIP ports for most game consoles from the 6th generation onwards! See [docs](/docs) for images.
+- optional [config.ini](example.ini) file to change client behaviour. Create an empty config.ini to avoid passing cli args.
+- OpenGL renderer, build with GL=1 in make or -gl in batchfile. ::gl ingame lets you toggle it visually. Do not build with GL support if you only want to use the software rasterizer to avoid continuous ram>vram copies!
+
+type `::perf` command ingame to see fps and lrucache size
+
+## Platforms
+To move the executable you have to take the correct `SDL.dll`, `config.ini`, and the `rom/` directory along with it. The consoles will load the rom/ directory from hard drive, sd card, cd, or romfs.
+
+When adding a new platform also add a system ttf font closest to helvetica in gameshell_draw_string when available to avoid Roboto dependency.
+
+Most consoles require panning to see the entire screen, there are forks for some targets that support 480p resolution.
+
+all consoles before the 6th generation generally have no standard way of connecting to the internet, much less ram, processing power, lower resolutions (240p or 480i). The engine fits quite well though (software rasterizer with gouraud/flat/textured triangles, fixed point, efficient 3d depth without qsort or zbuffer) but would have to be scoped down a lot.
+
+### Windows 95 to Windows 11
+To build simply run `build.bat` to get the client.exe, tinyc compiler and SDL dlls are provided (only SDL1 works prior to winXP and is only 32 bit)
+
+On windows 95/98 you should set your display to 32 bit true-color for the game to look correct
+
+If the client fails to start you either aren't passing cli args and don't have a config.ini OR you are using a SDL dll for the wrong architecture. Delete it and it'll be copied during next build
+
+SDL1 is default for tcc and old mingw-gcc to target windows 9x, This (unofficial) release doesn't require msys install: https://github.com/fsb4000/gcc-for-Windows98/releases. mingw-gcc 11 optimizations seem to only be slightly faster than tcc though.
+
+To reproduce the tcc binary you have to build tcc with `-t 32`, using gcc from EG [w64devkit](#tools), then once more with tcc to fix system lib linking. Optionally use `TCC_C=..\tcc.c` env var to not depend on libtcc. Example:
+```
+build-tcc.bat -t 32 -i your/bindir
+build-tcc.bat -t 32 -c tcc -i your/bindir
+```
+
+To be able to run some emulators on WSL2 you may need to prefix `MESA_GL_VERSION_OVERRIDE=4.6 MESA_GLSL_VERSION_OVERRIDE=460`.
+
+[v86](#tools) is a x86 PC emulator running in the browser, including older windows.
+
+You might want the updated [PowerShell](#tools) for run.ps1 (let's you run the game from shell process without terminate batch job message)
+
+```
+TODO: make win9x compatible batch file (no delayed expansion?), also tcc for win9x requires replacing _strtoui64
+TODO: clean up ps1 script so it doesn't need to be modified
+
+NOTE: on v86 PC emulator the cursor flickers on win95
+```
+
+### Linux GNU or musl
+Makefile: gcc, clang, tcc, mingw-gcc, emcc
+
+If tcc from your package manager isn't working you should build latest [tcc](#tools) from source
+
+arm+musl platforms like postmarketOS can use tcc but it requires some small tweaks:
+- comment out wchar_t in include/stddef.h
+- build with: https://lists.gnu.org/archive/html/tinycc-devel/2022-02/msg00038.html
+TODO SDL3 fails to init?
+
+### FreeBSD
+Install sdl1/sdl2 or sdl3+pkgconf and run `gmake SDL=1/2/3`
+
+### MacOS
+for GL:
+`brew install libsdl12-compat`
+`make GL=1 SDL=1`
+
+### Web (clang)
+Install clang and get [wasmlite](#tools) (you need the libc and generated index.html)
+then run `make -f wasm.mk DEBUG=0` with correct sysroot path to find libc.
+
+- Copy client.wasm, index.html, and config.ini with same port as the server and no socketip set to `Server/engine/public/client` (see make cpclients target)
+- Run server and visit `localhost:port/client/index.html?client` (or another entrypoint) and optionally append `&arg 1&arg 2&arg 3&arg 4` if no config.
+
+You can press shift-enter to switch pixel scaling, alt-enter for fullscreen toggle.
+
+```
+TODO: fwrite maps like emscripten
+TODO: add to build.bat/ps1 to replace emscripten
+```
+
+### Web (emscripten)
+Install [emsdk](#tools)
+run `emmake make DEBUG=0`/`make CC=emcc DEBUG=0` or `build.bat -c emcc -r` for windows
+
+Clang+wasmlite is recommended over emscripten for many reasons: avoids random issues, codesize, performance etc. But it works.
+
+- Copy client.html and config.ini with correct port to `Server/engine/public/client`, it embeds the js and wasm at slight cost of code size.
+- Run server and visit `localhost:port/client/client.html` (or another entrypoint)
+
+```
+TODO: audio stream is pushed to on same thread causing scape_main stutters, and lowmem w/o audio speeds up (typescript client uses absolute time for idlecycles)
+TODO: use indexeddb (add cacheload and cachesave), and maybe add [web worker clientstream](https://emscripten.org/docs/api_reference/wasm_workers.html)
+TODO: mobile controls: touch on release + touch to rotate + osk + mouse+kbd, PWA manifest
+
+NOTE: runnable on older browsers by swapping -sJSPI with -sASYNCIFY
+NOTE: could replace sdl3 audio (codesize) with https://emscripten.org/docs/api_reference/wasm_audio_worklets.html and decodeAudioData for wavs
+NOTE: unused old worldlist code: [shell.html](https://github.com/lesleyrs/Client3/commit/5da924b9f766005e82163d899e52a5df2f771584#diff-c878553ed816480a5e85ff602ff3c5d38788ca1d21095cd8f8ebc36a4dbc07ee) maybe re-add argv from url to not require config
+```
+
+### Android
+1. `mkdir ~/android && cd ~/android` and download [android command line tools](#tools) to it + accept licenses whenever it asks
+2. enable developer options by tapping build number, then you can pair and connect to the device through wifi:
+`$HOME/android/platform-tools/adb pair IP:PORT`
+`$HOME/android/platform-tools/adb connect IP:PORT`
+3. In Client3/android-project run `ANDROID_HOME="$HOME/android/" ./gradlew installDebug`
+4. The APK will be in android-project/app/build/outputs/apk/debug/ and installed on the device
+
+- you can also start it remotely: `$HOME/android/platform-tools/adb shell am start -n org.libsdl.app/.SDLActivity`
+- show error/fatal logging with:  `$HOME/android/platform-tools/adb logcat *:E | grep 'org.libsdl.app'`
+
+#### Steps to update/reproduce the current android setup:
+1. in Client3/android-project/app/jni run `mkdir SDL`
+2. git clone SDL, git checkout SDL2 branch and run `cp -r Android.mk include src SDL`
+3. symlink src and rom directories:
+```sh
+cd android-project/app/jni/src && ln -s ../../../../src src
+cd android-project/app/src/main && ln -s ../../../../rom assets
+```
+5. set Client LOCAL_CFLAGS and LOCAL_SRC_FILES app/jni/src/Android.mk
+6. enable networking in app/src/main/AndroidManifest.xml `<uses-permission android:name="android.permission.INTERNET" />`
+
+https://github.com/libsdl-org/SDL/blob/SDL2/docs/README-android.md - from "For more complex projects"
+
+https://github.com/libsdl-org/SDL/blob/SDL2/docs/README-touch.md
+```
+TODO: long press right click? click on touch release? hold in viewport to rotate? share code with postmarketos
+TODO: osk by adding using custom.c funcs (move them to gameshell?)
+```
+### Nintendo consoles (devkitPro)
+Install [devkitpro](#tools) and run `dkp-pacman -S console-dev` replace console with (nds/wii/3ds/wiiu/switch).
+
+Wii U and Switch also need the (wiiu/switch)-sdl2 package.
+
+build: `make -f (nds/wii/3ds/wiiu/switch).mk -j$(nproc) -B`.
+
+#### Wii
+in dolphin emulator you can find the sdcard path in `options>configuration>wii>sd card` settings and after moving the files there you have to click `Convert Folder to File Now` to format it.
+
+Controls: wiimote IR pointer works as mouse, A for left click, B for right click, Dpad works as arrow keys, minus for control, plus to pan by moving your wiimote to a side of the screen, 1 to center screen, home button to exit. The nunchuck joystick can also be used as arrow keys.
+
+```
+TODO: support usb keyboard (dolphin doesn't emulate it yet)
+TODO: add game offset expected for real hardware?
+TODO: shutdown on dolphin X (same as retail games)
+
+NOTE: edges of pixmaps flicker and have incorrect color due to wii framebuffer setting 2 pixels at a time which can overlap.
+```
+
+#### NDS
+not working, DSi might work (16 mb ram, wpa2 wifi) with heavy changes but the resolution is too low for the viewport. ENTRY=playground does work
+
+the gpu only has vram for 2k triangles and 6k verts, but render to framebuffer + half fps allows for double:
+https://blocksds.skylyrac.net/tutorial/advanced/video_capture/#6-two-pass-3d
+
+to boot in melonDS you need to set emulation to DSi, set bios/firmware/nand paths + enable sd card, and go to firmware settings > override settings from external firmware
+
+on 3ds you can use godmode9i or twilightmenu++ as ds loader
+
+rom/config.ini has to be modified before compiling as it's stored in nitrofs
+
+#### 3DS
+barely playable, the resolution is too low for the viewport and requires panning
+
+in citra emulator click `file>open citra folder` for sdmc dir https://citra-emulator.com/wiki/user-directory/
+
+on real hardware move the contents of the rom/ dir next to the 3dsx file.
+
+Controls:
+- Touch to left click + hold A to right click
+- Circle/Dpad for arrow keys + hold L/R to pan top/bot screens
+- B for control (run)
+- Start to align bottom screen, Select to toggle ::perf stats
+
+```
+TODO: fix crashing sometimes on home button exit
+TODO: backlight toggle? pica gpu hw accel
+TODO: possible to toggle top screen between console and fb? right now requires 2 loc changes
+TODO: see new 2ds/3ds performance with higher cpu clock, old 2ds runs at ~10-20
+TODO: why romfs (when used) breaks map loc data, applies to wii u and switch too, can avoid by setting data to NULL to download
+```
+
+#### Wii U
+in cemu emulator click `file>open Cemu folder`, enter sdcard directory and paste rom/ dir into it
+
+in cemu go to Debug>Open logging window to see output streams.
+
+Controls: dpad for arrow keys, A unused, B for right click on touch, X for control (run toggle), Y for ::perf toggle
+
+```
+NOTE: sdl2 wav audio sounds a bit slow on cemu
+NOTE: tinysoundfont lib doesn't work on powerpc
+```
+
+#### Switch
+in eden emulator (yuzu fork) click `file->open eden folders` enter sdmc dir and paste rom/ dir into it
+
+set `lowmem = 0` in config for audio
+
+Controls: dpad for arrow keys, A unused, B for right click on touch, X for control (run toggle), Y for ::perf toggle
+
+```
+TODO: left joystick cam, right joystick mouse pointer, left trigger right click, right trigger left click?
+NOTE: GL11 is probably not needed, maybe separate switch platform if issues occur
+NOTE: nxlink can be useful https://switch.homebrew.guide/homebrew_dev/app_dev.html#debugging
+```
+
+### Sony PSP
+barely playable, the resolution is too low for the viewport and requires panning
+
+Install [pspdev](#tools) and run `make -f psp.mk -j$(nproc) -B`.
+
+ppsspp emulator loads relative dir as memstick, so the filesystem works automatically. Also you should probably enable printf logging with `settings>tools>developer tools>logging channels>printf` to EG verbose
+
+Controls: move cursor with analog stick, O for left click, X for right click, /\ for control, Dpad as arrow keys, Rtrigger + analog stick to pan, Ltrigger to reset screen position
+
+Works on real hardware but requires at least model 2000 due to only 24MB (28MB with kernel mode not sure if safe to use?) being accessible on model 1000
+
+### Sony PS Vita
+Install [vitasdk](#tools) and run `make -f vita.mk -j$(nproc) -B`.
+
+Controls: dpad for arrow keys, circle unused, cross for right click on touch, triangle for control (run toggle), square for ::perf toggle
+
+For OpenGL to work you need to build with GL=1 and install `libshacccg.suprx`: https://github.com/Rinnegatamante/vitaGL/tree/master#prerequisites
+
+To see OpenGL error messages build vitaGL with LOG_ERRORS=1
+
+can test with Vita3K, instead of decompressing the vpk you can copy just the eboot.bin after changes (pass `-r VSDK20225` to run directly)
+
+NOTE: https://github.com/Vita3K/Vita3K/issues/4064 vita3k emu doesn't support glScissor so scene appears as white unless removed
+
+run `make vita_assets` to regenerate live area.
+
+### Sony PS2
+not started, should be doable
+```
+TODO: see what softmods work on real hw, has 32 mb ram, builtin ethernet only for slim models
+```
+
+### Sega Dreamcast
+Install [kallistios and mkdcdisc](#tools) and run `make -f dreamcast.mk -j$(nproc) -B`. Necessary files are built into the cdi.
+
+To try on real hardware you'd need networking support and the 32 MB ram expansion mod, which seems involved and maybe less compatible with some other games. Flycast seems to be the best emulator and supports both.
+
+See defines.h for inauthentic changes to get below 32MB RAM usage. The city of Ardougne isn't accessible as it uses up to 12MB ram in allocator.
+
+Controls: joystick = move cursor, Dpad = arrow keys, B = left click, A = right click, Y = control, Ltrig = center screen, Rtrig+joystick = pan screen
+
+There's currently no way to type. But it's not required to play the game and you can set your login details in rom/config.ini
+
+```
+TODO: finish opengl 1.1 port for dreamcast?
+TODO: support mouse/keyboard for dreamcast. For mouse and keyboard in flycast you have to set the physical device ports to dreamcast device port, but mouse is not very useful in emu until they hide the system cursor.
+
+NOTE: if the cdi doesn't load you might have to remove --no-padding in Makefile? untested on hardware
+NOTE: local servers don't work on emulator? only remote servers work
+```
+
+### Microsoft Xbox
+Install [nxdk](#tools) and run `make -f xbox.mk -j$(nproc) -B`. Necessary files are built into the iso.
+
+To run with xemu use `-dvd_path client.iso` as args.
+
+Controls: right analog stick to move the mouse, dpad to rotate camera, B = left click, A = right click, Y = control, X = toggle fps, back = logout, start = login, white = center screen pan, black = pan with right analog stick
+
+```
+TODO: audio on highmem (for 128mb ram expansion?)
+
+NOTE: local servers don't work on emulator? only remote servers work
+NOTE: default.xbe stays around in rom dir when it's junk for other consoles that embed that directory. Can remove it after building.
+NOTE: fopen had to be separated due to the need for backwards slashes, also there's no chdir equivalent?
+```
+
+## Java client
+The 2004 jar is stored for comparisons, run with EG: `java -cp bin/runescape.jar client 10 0 highmem members` but:
+- there is no audio, it saves audio files for the browser to play which is no longer applicable
+- right clicking breaks past java 8
+- window insets on modern systems are causing the sides of the game to be cut off slightly
+- outside of windows it saves the cache to `/tmp` so every reboot you may have to redownload it
+- it only connects to localhost if it's not running as applet
+- server http port needs to be set to 80 (2004scape on linux defaults to 8888 right now to avoid sudo)
+- TODO confirm: to connect to local java servers on WSL from Windows you might need to add `-Djava.net.preferIPv6Addresses=true` when running client
+
+## libraries
+* [micro-bunzip](https://landley.net/code/) | https://landley.net/code/bunzip-4.1.c
+* [isaac](https://burtleburtle.net/bob/rand/isaacafa.html) | https://burtleburtle.net/bob/c/readable.c
+* [TinySoundFont](https://github.com/schellingb/TinySoundFont) - with fix for attack1.mid by skipping RIFF header and android support
+* [tiny-bignum-c](https://github.com/kokke/tiny-bignum-c) - prefer libtom/openssl/bigint, but works fine with smaller exponent
+* [LibTomMath](https://github.com/libtom/libtommath) | mpi.c is from gen.pl script in [releases](https://github.com/libtom/libtommath/releases/latest). with added ifdefs to fix non-gcc builds.
+* [ini](https://github.com/rxi/ini)
+* [stb_image and stb_truetype](https://github.com/nothings/stb)
+
+## optional libraries
+* [OpenSSL](https://github.com/openssl/openssl) | https://wiki.openssl.org/index.php/Binaries
+
+* [SDL-1.2](https://github.com/libsdl-org/SDL-1.2) | [SDL-2/SDL-3](https://github.com/libsdl-org/SDL) | https://libsdl.org/release/
+
+Using prebuilt SDL but removed tests, SDL1 mingw dotfiles + SDL1 tcc fixes in VC (fixed upstream but no new releases since 2012)
+
+## tools
+* [tcc](https://github.com/TinyCC/tinycc) | https://bellard.org/tcc/
+* [emsdk](https://github.com/emscripten-core/emsdk) | https://emscripten.org/docs/getting_started/downloads.html
+* [devkitpro](https://github.com/devkitPro) | https://devkitpro.org/
+* [pspdev](https://github.com/pspdev/pspdev) | https://pspdev.github.io/
+* [vitasdk](https://github.com/vitasdk/vdpm) | https://vitasdk.org/
+* [kallistios](https://github.com/KallistiOS/KallistiOS) | [mkdcdisc](https://gitlab.com/simulant/mkdcdisc)
+* [nxdk](https://github.com/XboxDev/nxdk)
+* [android command line tools](https://developer.android.com/studio)
+* [powershell](https://github.com/PowerShell/PowerShell)
+* [v86](https://github.com/copy/v86.git) | https://copy.sh/v86/
+* [wasmlite](https://github.com/lesleyrs/wasmlite)
+* [w64devkit](https://github.com/skeeto/w64devkit)

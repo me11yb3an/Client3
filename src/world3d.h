@@ -7,6 +7,10 @@
 #include "occlude.h"
 
 #define LEVEL_COUNT 4
+#define WORLD_VIS_RADIUS 75
+#define WORLD_VIS_SIZE (2*WORLD_VIS_RADIUS+1)
+int world3d_draw_radius(void);
+int world3d_far_clip(void);
 
 // name taken from rsc
 typedef struct {
@@ -53,8 +57,8 @@ typedef struct {
     int activeOccluderCount;
     Occlude *activeOccluders[500];
     LinkList *drawTileQueue;   // = new LinkList();
-    bool (*visibilityMatrix)[32][51][51]; //[8][32][51][51];
-    bool (*visibilityMap)[51];
+    bool (*visibilityMatrix)[32][WORLD_VIS_SIZE][WORLD_VIS_SIZE]; //[8][32][51][51];
+    bool (*visibilityMap)[WORLD_VIS_SIZE];
     int viewportCenterX;
     int viewportCenterY;
     int viewportLeft;

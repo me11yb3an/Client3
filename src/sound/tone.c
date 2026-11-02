@@ -3,7 +3,6 @@
 #include <stdlib.h>
 
 #include "../platform.h"
-#include "../defines.h"
 #include "tone.h"
 
 static int generate(int amplitude, int phase, int form);
@@ -53,7 +52,7 @@ void tone_init_global(void) {
 
     _Tone.sin = calloc(32768, sizeof(int));
     for (int i = 0; i < 32768; i++) {
-        _Tone.sin[i] = (int)(SIN((DOUBLE)i / 5215.1903) * 16384.0);
+        _Tone.sin[i] = (int)(sin((double)i / 5215.1903) * 16384.0);
     }
 
     _Tone.buffer = calloc(220500, sizeof(int)); // 10s * 22050 KHz
@@ -68,7 +67,7 @@ int *tone_generate(Tone *tone, int sampleCount, int length) {
         return _Tone.buffer;
     }
 
-    DOUBLE samplesPerStep = (DOUBLE)sampleCount / ((DOUBLE)length + 0.0);
+    double samplesPerStep = (double)sampleCount / ((double)length + 0.0);
 
     envelope_reset(tone->frequencyBase);
     envelope_reset(tone->amplitudeBase);
@@ -80,8 +79,8 @@ int *tone_generate(Tone *tone, int sampleCount, int length) {
     if (tone->frequencyModRate) {
         envelope_reset(tone->frequencyModRate);
         envelope_reset(tone->frequencyModRange);
-        frequencyStart = (int)((DOUBLE)(tone->frequencyModRate->end - tone->frequencyModRate->start) * 32.768 / samplesPerStep);
-        frequencyDuration = (int)((DOUBLE)tone->frequencyModRate->start * 32.768 / samplesPerStep);
+        frequencyStart = (int)((double)(tone->frequencyModRate->end - tone->frequencyModRate->start) * 32.768 / samplesPerStep);
+        frequencyDuration = (int)((double)tone->frequencyModRate->start * 32.768 / samplesPerStep);
     }
 
     int amplitudeStart = 0;
@@ -90,17 +89,17 @@ int *tone_generate(Tone *tone, int sampleCount, int length) {
     if (tone->amplitudeModRate) {
         envelope_reset(tone->amplitudeModRate);
         envelope_reset(tone->amplitudeModRange);
-        amplitudeStart = (int)((DOUBLE)(tone->amplitudeModRate->end - tone->amplitudeModRate->start) * 32.768 / samplesPerStep);
-        amplitudeDuration = (int)((DOUBLE)tone->amplitudeModRate->start * 32.768 / samplesPerStep);
+        amplitudeStart = (int)((double)(tone->amplitudeModRate->end - tone->amplitudeModRate->start) * 32.768 / samplesPerStep);
+        amplitudeDuration = (int)((double)tone->amplitudeModRate->start * 32.768 / samplesPerStep);
     }
 
     for (int harmonic = 0; harmonic < 5; harmonic++) {
         if (tone->harmonicVolume[harmonic] != 0) {
             _Tone.tmpPhases[harmonic] = 0;
-            _Tone.tmpDelays[harmonic] = (int)((DOUBLE)tone->harmonicDelay[harmonic] * samplesPerStep);
+            _Tone.tmpDelays[harmonic] = (int)((double)tone->harmonicDelay[harmonic] * samplesPerStep);
             _Tone.tmpVolumes[harmonic] = (tone->harmonicVolume[harmonic] << 14) / 100;
-            _Tone.tmpSemitones[harmonic] = (int)((DOUBLE)(tone->frequencyBase->end - tone->frequencyBase->start) * 32.768 * POW(1.0057929410678534, tone->harmonicSemitone[harmonic]) / samplesPerStep);
-            _Tone.tmpStarts[harmonic] = (int)((DOUBLE)tone->frequencyBase->start * 32.768 / samplesPerStep);
+            _Tone.tmpSemitones[harmonic] = (int)((double)(tone->frequencyBase->end - tone->frequencyBase->start) * 32.768 * pow(1.0057929410678534, tone->harmonicSemitone[harmonic]) / samplesPerStep);
+            _Tone.tmpStarts[harmonic] = (int)((double)tone->frequencyBase->start * 32.768 / samplesPerStep);
         }
     }
 
@@ -165,7 +164,7 @@ int *tone_generate(Tone *tone, int sampleCount, int length) {
     }
 
     if (tone->reverbDelay > 0 && tone->reverbVolume > 0) {
-        int start = (int)((DOUBLE)tone->reverbDelay * samplesPerStep);
+        int start = (int)((double)tone->reverbDelay * samplesPerStep);
 
         for (int sample = start; sample < sampleCount; sample++) {
             _Tone.buffer[sample] += _Tone.buffer[sample - start] * tone->reverbVolume / 100;

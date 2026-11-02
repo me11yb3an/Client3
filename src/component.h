@@ -23,11 +23,6 @@
 #define BUTTON_SELECT 5
 #define BUTTON_CONTINUE 6
 
-// NOTE this wastes some memory as there's many Component instances but it's easiest to allocate inside the struct
-// null terminated
-#define MAX_TEXT_LENGTH 149
-#define MAX_OPTION_LENGTH 30
-
 typedef struct {
     int *invSlotObjId;
     int *invSlotObjCount;
@@ -115,8 +110,8 @@ typedef struct {
     int *childId;
     int *childX;
     int *childY;
-    // int unusedShort1;
-    // bool unusedBoolean1;
+    int unusedShort1;
+    bool unusedBoolean1;
     bool draggable;
     bool interactable;
     bool usable;
@@ -130,7 +125,7 @@ typedef struct {
     bool center;
     bool shadowed;
     PixFont *font;
-    char *text;
+    char text[DOUBLE_STR]; // arbitrary length, had to double it to stop overflow
     char *activeText;
     int colour;
     int activeColour;
@@ -147,7 +142,7 @@ typedef struct {
     char *actionVerb;
     char *action;
     int actionTarget;
-    char *option;
+    char option[HALF_STR + 1]; // 30-character option plus terminating NUL
 
     int childCount;
     int comparatorCount;
@@ -166,4 +161,3 @@ void component_unpack(Jagfile *jag, Jagfile *media, PixFont **fonts);
 Pix24 *component_get_image(Jagfile *media, char *sprite, int spriteId);
 Model *component_get_model(int id);
 Model *component_get_model2(Component *com, int primaryFrame, int secondaryFrame, bool active, bool *_free);
-void realloc_and_copy(char** to, char* from);

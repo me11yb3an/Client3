@@ -1,3 +1,6 @@
+#ifdef BUILD_A_EMBEDDED
+#include "offline_stream.inc"
+#else
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -223,6 +226,7 @@ ClientStream *clientstream_opensocket(int port) {
     stream->socket = socket();
     int ret = connect(stream->socket, url, stream, onopen, NULL, onerror, onclose);
     if (ret < 0) {
+        clientstream_destroy(stream);
         return NULL;
     }
     return stream;
@@ -266,7 +270,7 @@ ClientStream *clientstream_opensocket(int port) {
 #if defined(_WIN32) && defined(__i386__)
         rs2_error("getaddrinfo(): %d\n", status);
 #else
-        rs2_error("getaddrinfo(): %d. %s\n", status, gai_strerror(status));
+        rs2_error("getaddrinfo(): %s\n", gai_strerror(status));
 #endif
         stream->closed = 1;
         free(stream);
@@ -297,7 +301,7 @@ ClientStream *clientstream_opensocket(int port) {
     stream->socket = (int)socket(AF_INET, SOCK_STREAM, 0);
     if (stream->socket < 0) {
         rs2_error("socket error: %s (%d)\n", strerror(errno), errno);
-        clientstream_close(stream);
+        clientstream_destroy(stream);
         return NULL;
     }
 
@@ -338,16 +342,18 @@ ClientStream *clientstream_opensocket(int port) {
     setsockopt(stream->socket, SOL_SOCKET, SO_SNDTIMEO, (const char *)&socket_timeout, sizeof(socket_timeout));
 #endif
 
-#if defined(__PSP__) || defined(__vita__) || defined(__ps2sdk__) || defined(_arch_dreamcast)
+#if defined(__vita__)
+    // vita: blocking connect, set non-blocking afterwards
+#elif defined(__PSP__) || defined(__ps2sdk__) || defined(_arch_dreamcast)
     int flags = fcntl(stream->socket, F_GETFL, 0);
     if (flags == -1) {
         rs2_error("fcntl F_GETFL failed\n");
-        clientstream_close(stream);
+        clientstream_destroy(stream);
         return NULL;
     }
     if (fcntl(stream->socket, F_SETFL, flags | O_NONBLOCK) == -1) {
         rs2_error("fcntl F_SETFL failed\n");
-        clientstream_close(stream);
+        clientstream_destroy(stream);
         return NULL;
     }
 #else
@@ -355,7 +361,7 @@ ClientStream *clientstream_opensocket(int port) {
 
     if (ret < 0) {
         rs2_error("ioctl() error: %d\n", ret);
-        clientstream_close(stream);
+        clientstream_destroy(stream);
         return NULL;
     }
 #endif
@@ -373,7 +379,7 @@ ClientStream *clientstream_opensocket(int port) {
 #ifdef _WIN32
         if (WSAGetLastError() == WSAEWOULDBLOCK) {
 #else
-        if (errno == EINPROGRESS) {
+        if (errno == EINPROGRESS || errno == EAGAIN) {
 #endif
             // TODO: why 5 seconds? from rsc-c
             struct timeval timeout = {0};
@@ -394,7 +400,7 @@ ClientStream *clientstream_opensocket(int port) {
                 if (getsockopt(stream->socket, SOL_SOCKET, SO_ERROR, (void *)(&valopt), &lon) < 0) {
                     rs2_error("getsockopt() error:  %s (%d)\n", strerror(errno),
                               errno);
-
+                    clientstream_destroy(stream);
                     return NULL;
                 }
 #else
@@ -409,18 +415,24 @@ ClientStream *clientstream_opensocket(int port) {
                 }
             } else if (ret == 0) {
                 rs2_error("connect() timeout\n");
-                clientstream_close(stream);
+                clientstream_destroy(stream);
                 return NULL;
             }
         }
     }
+#ifdef __vita__
+    if (ret == 0) {
+        int vflags = fcntl(stream->socket, F_GETFL, 0);
+        fcntl(stream->socket, F_SETFL, vflags | O_NONBLOCK);
+    }
+#endif
 #endif /* not EMSCRIPTEN */
 
     if (ret < 0 && errno != 0) {
         rs2_error("connect() error: %s (%d)\n", strerror(errno), errno);
         // fixes emulators
-#if !defined(__vita__) && !defined(__3DS__) && !defined(__SWITCH__)
-        clientstream_close(stream);
+#if !defined(__vita__) && !defined(__3DS__)
+        clientstream_destroy(stream);
         return NULL;
 #endif
     }
@@ -438,6 +450,14 @@ void clientstream_close(ClientStream *stream) {
     stream->closed = true;
     // TODO just let it leak for now
     // free(stream);
+}
+
+void clientstream_destroy(ClientStream *stream) {
+    if (!stream) {
+        return;
+    }
+    clientstream_close(stream);
+    free(stream);
 }
 
 int clientstream_available(ClientStream *stream, int len) {
@@ -527,7 +547,7 @@ int clientstream_read_bytes(ClientStream *stream, int8_t *dst, int off, int len)
 
 int clientstream_write(ClientStream *stream, const int8_t *src, int len, int off) {
     if (!stream->closed) {
-#if defined(_WIN32) || defined(__SWITCH__) || defined(__NDS__) || defined(__wasm)
+#if defined(_WIN32) || defined(__SWITCH__) || defined(__NDS__) || defined(__wasm) || defined(__vita__)
         return send(stream->socket, (const char *)src + off, len, 0);
 #else
         return write(stream->socket, src + off, len);
@@ -563,3 +583,5 @@ const char *dnslookup(const char *hostname) {
     return host->h_name;
 #endif
 }
+
+#endif

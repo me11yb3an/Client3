@@ -1,3 +1,4 @@
+#include "../ba_timing.h"
 /* micro-bunzip: http://www.landley.net/code/ */
 
 /*  Small bzip2 deflate implementation, by Rob Landley (rob@landley.net).
@@ -682,6 +683,7 @@ static void bzip_fatal(int retval) {
 
 void bzip_decompress(int8_t *file_data, int8_t *archive_data, int archive_size,
                      int offset) {
+    BA_PROFILE_ALWAYS(BA_BZIP);
     uint8_t *headered = malloc(archive_size + 4);
     memcpy(headered, BZIP_HEADER, 4);
     memcpy(headered + 4, archive_data + offset, archive_size);

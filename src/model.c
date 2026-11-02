@@ -1,3 +1,9 @@
+#include "r11_diag.h"
+#include "r10_scene.h"
+#include "r75_hover_bounds.h"
+#include "r82_project_divide.h"
+#include <stdio.h>
+#include "ba_timing.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,16 +15,23 @@
 #include "defines.h"
 #include "jagfile.h"
 #include "model.h"
+#include "world3d.h"
 #include "pix2d.h"
 #include "pix3d.h"
 #include "platform.h"
 #include "gl11.h"
+#include "ba_hw_r3.h"
+#include "r16_fast.h"
+
+#include "r57_body_layers.inc"
 
 ModelData _Model = {0};
 extern Pix3D _Pix3D;
 extern Pix2D _Pix2D;
 extern AnimFrameData _AnimFrame;
+#ifdef GL11
 extern Custom _Custom;
+#endif
 
 void model_init_global(void) {
     _Model.face_clipped_x = calloc(4096, sizeof(bool));
@@ -57,6 +70,7 @@ void model_init_global(void) {
 }
 
 void model_free_global(void) {
+    r57_reset_body_layers();
     for (int i = 0; i < _Model.metadata_count; i++) {
         free(_Model.metadata[i]);
     }
@@ -104,12 +118,14 @@ void model_free_global(void) {
 }
 
 void model_free_calculate_normals(Model *m) {
+    r10_model_changed_mask(m,1);
     free(m->face_color_a);
     free(m->face_color_b);
     free(m->face_color_c);
 }
 
 void model_free_label_references(Model *m) {
+    r10_model_changed_mask(m,1);
     free(m->label_vertices_index_count);
     free(m->label_faces_index_count);
     for (int i = 0; i < m->label_vertices_count; i++) {
@@ -126,10 +142,12 @@ void model_free_label_references(Model *m) {
 }
 
 static void model_free_vertex_y(Model *m) {
+    r10_model_changed_mask(m,1);
     free(m->vertices_y);
 }
 
 static void model_free_faces(Model *m) {
+    r10_model_changed_mask(m,1);
     free(m->face_color_a);
     free(m->face_color_b);
     free(m->face_color_c);
@@ -141,22 +159,29 @@ static void model_free_faces(Model *m) {
 }
 
 static void model_free_copy_vertex_y(Model *m) {
+    r10_model_changed_mask(m,1);
     model_free_vertex_y(m);
+    r57_release_body_layers(m->r57_body_layers);
     free(m);
 }
 
 static void model_free_copy_faces(Model *m) {
+    r10_model_changed_mask(m,1);
     model_free_faces(m);
+    r57_release_body_layers(m->r57_body_layers);
     free(m);
 }
 
 static void model_free_copy(Model *m) {
+    r10_model_changed_mask(m,1);
     model_free_vertex_y(m);
     model_free_faces(m);
+    r57_release_body_layers(m->r57_body_layers);
     free(m);
 }
 
 void model_free_share_colored(Model *m, bool shareColors, bool shareAlpha, bool shareVertices) {
+    r10_model_changed_mask(m,1);
     if (!shareVertices) {
         free(m->vertices_x);
         free(m->vertices_y);
@@ -170,10 +195,12 @@ void model_free_share_colored(Model *m, bool shareColors, bool shareAlpha, bool 
     if (!shareAlpha) {
         free(m->face_alphas);
     }
+    r57_release_body_layers(m->r57_body_layers);
     free(m);
 }
 
 void model_free_share_alpha(Model *m, bool shareAlpha) {
+    r10_model_changed_mask(m,1);
     free(m->vertices_x);
     free(m->vertices_y);
     free(m->vertices_z);
@@ -181,10 +208,12 @@ void model_free_share_alpha(Model *m, bool shareAlpha) {
     if (!shareAlpha) {
         free(m->face_alphas);
     }
+    r57_release_body_layers(m->r57_body_layers);
     free(m);
 }
 
 void model_free(Model *model) {
+    r10_model_changed_mask(model,1);
     free(model->vertices_x);
     free(model->vertices_y);
     free(model->vertices_z);
@@ -205,6 +234,7 @@ void model_free(Model *model) {
     free(model->face_color_a);
     free(model->face_color_b);
     free(model->face_color_c);
+    r57_release_body_layers(model->r57_body_layers);
     free(model);
 }
 
@@ -592,6 +622,7 @@ Model *model_from_models(Model **models, int count, bool use_allocator) {
             }
         }
     }
+    r57_merge_body_layers(new,models,count);
     return new;
 }
 
@@ -617,14 +648,14 @@ Model *model_from_models_bounds(Model **models, int count) {
             copyInfo |= model->face_infos != NULL;
 
             if (model->face_priorities) {
+                copyPriority = true;
+            } else {
                 if (new->model_priority == -1) {
                     new->model_priority = model->model_priority;
                 }
                 if (new->model_priority != model->model_priority) {
                     copyPriority = true;
                 }
-            } else {
-                copyPriority = true;
             }
 
             copyAlpha |= model->face_alphas != NULL;
@@ -719,11 +750,14 @@ Model *model_from_models_bounds(Model **models, int count) {
     }
 
     model_calculate_bounds_cylinder(new);
+    r57_merge_body_layers(new,models,count);
     return new;
 }
 
 Model *model_share_colored(Model *src, bool shareColors, bool shareAlpha, bool shareVertices, bool use_allocator) {
     Model *new = rs2_calloc(use_allocator, 1, sizeof(Model));
+    new->r10_animated=src->r10_animated;
+    new->r57_body_layers=r57_retain_body_layers(src->r57_body_layers);
     new->vertex_count = src->vertex_count;
     new->face_count = src->face_count;
     new->textured_face_count = src->textured_face_count;
@@ -778,6 +812,8 @@ Model *model_share_colored(Model *src, bool shareColors, bool shareAlpha, bool s
 
 Model *model_copy_faces(Model *src, bool copyVertexY, bool copyFaces, bool use_allocator) {
     Model *new = rs2_calloc(use_allocator, 1, sizeof(Model));
+    new->r10_animated=src->r10_animated;
+    new->r57_body_layers=r57_retain_body_layers(src->r57_body_layers);
     new->vertex_count = src->vertex_count;
     new->face_count = src->face_count;
     new->textured_face_count = src->textured_face_count;
@@ -857,6 +893,8 @@ Model *model_copy_faces(Model *src, bool copyVertexY, bool copyFaces, bool use_a
 
 Model *model_share_alpha(Model *src, bool shareAlpha) {
     Model *new = calloc(1, sizeof(Model));
+    new->r10_animated=src->r10_animated;
+    new->r57_body_layers=r57_retain_body_layers(src->r57_body_layers);
     new->vertex_count = src->vertex_count;
     new->face_count = src->face_count;
     new->textured_face_count = src->textured_face_count;
@@ -968,11 +1006,44 @@ void model_draw_simple(Model *m, int pitch, int yaw, int roll, int eyePitch, int
 }
 
 void model_draw(Model *m, int yaw, int sinCameraPitch, int cosCameraPitch, int sinCameraYaw, int cosCameraYaw, int sceneX, int sceneY, int sceneZ, int key) {
+ R11_SCOPE(R11_PROJECT);
+#if BA_R10_CACHE
+    uint64_t r10_project_at=ba_timing_now();
+#endif
+    /* Render isolation only: simulation, scene insertion, assets and server retained. */
+    if(h3_mode()=='C'||(h3_mode()=='D'&&(((unsigned)key>>29)&3u)<2u))return;
+    BA_PROFILE_SCOPE(BA_MODEL);
+#ifdef GL11
+    if (r16_emitting() && _Custom.use_opengl11) {
+        if (!m || m->face_count <= 0) return;
+        if (!r16_baking()) {
+            int a = (sceneZ * cosCameraYaw - sceneX * sinCameraYaw) >> 16;
+            int b = (sceneY * sinCameraPitch + a * cosCameraPitch) >> 16;
+            int c = m->radius * cosCameraPitch >> 16;
+            int d = b + c;
+            if (d <= 50 || b >= world3d_far_clip()) return;
+            int e = (sceneZ * sinCameraYaw + sceneX * cosCameraYaw) >> 16;
+            int minScreenX = (e - m->radius) << 9;
+            if (minScreenX / d >= _Pix2D.center_x) return;
+            int maxScreenX = (e + m->radius) << 9;
+            if (maxScreenX / d <= -_Pix2D.center_x) return;
+            int f = (sceneY * cosCameraPitch - a * sinCameraPitch) >> 16;
+            int g = m->radius * sinCameraPitch >> 16;
+            int maxScreenY = (f + g) << 9;
+            if (maxScreenY / d <= -_Pix2D.center_y) return;
+            int h = g + (m->max_y * cosCameraPitch >> 16);
+            int minScreenY = (f - h) << 9;
+            if (minScreenY / d >= _Pix2D.center_y) return;
+        }
+        gl_start_model(m, sceneX, sceneY, sceneZ, yaw);
+        return;
+    }
+#endif
     int a = (sceneZ * cosCameraYaw - sceneX * sinCameraYaw) >> 16;
     int b = (sceneY * sinCameraPitch + a * cosCameraPitch) >> 16;
     int c = m->radius * cosCameraPitch >> 16;
     int d = b + c;
-    if (d <= 50 || b >= 3500) {
+    if (d <= 50 || b >= world3d_far_clip()) {
         return;
     }
     int e = (sceneZ * sinCameraYaw + sceneX * cosCameraYaw) >> 16;
@@ -1026,13 +1097,19 @@ void model_draw(Model *m, int yaw, int sinCameraPitch, int cosCameraPitch, int s
         cy = _Model.mouse_x - _Pix3D.center_x;
         yawsin = _Model.mouse_y - _Pix3D.center_y;
         if (cy > minScreenX && cy < maxScreenX && yawsin > minScreenY && yawsin < maxScreenY) {
-            if (m->pick_aabb) {
-                _Model.picked_bitsets[_Model.picked_count++] = key;
+            if (m->pickable) {
+                if (_Model.picked_count < 1000) _Model.picked_bitsets[_Model.picked_count++] = key;
             } else {
                 hasInput = true;
             }
         }
     }
+    /* Pickable scenery is already recorded from the screen box. Walking every
+     * vertex here is what kept a still camera at a handful of frames. */
+    if (r16_suppress_emit() && !hasInput) return;
+#if defined(GL11) && defined(__vita__)
+    if(r16_suppress_emit()&&hasInput&&!m->pickable&&!r75_hover_bounds(m->radius,m->max_y,m->min_y,sceneX,sceneY,sceneZ,sinCameraYaw,cosCameraYaw,sinCameraPitch,cosCameraPitch,_Pix3D.center_x,_Pix3D.center_y,_Model.mouse_x,_Model.mouse_y))return;
+#endif
     cx = _Pix3D.center_x;
     cy = _Pix3D.center_y;
     yawsin = 0;
@@ -1062,31 +1139,60 @@ void model_draw(Model *m, int yaw, int sinCameraPitch, int cosCameraPitch, int s
 
         _Model.vertex_screen_z[v] = z - b;
         if (z >= 50) {
-            _Model.vertex_screen_x[v] = cx + (x << 9) / z;
-            _Model.vertex_screen_y[v] = cy + (temp << 9) / z;
+            int screenX,screenY;r82_project_divide(x<<9,temp<<9,z,&screenX,&screenY);
+            _Model.vertex_screen_x[v] = cx + screenX;
+            _Model.vertex_screen_y[v] = cy + screenY;
         } else {
             _Model.vertex_screen_x[v] = -5000;
             project = true;
         }
-#ifdef GL11
-        if (!_Custom.use_opengl11) { // gl uses pmn_to_uv instead
-#endif
-            if (project || m->textured_face_count > 0) {
-                _Model.vertex_view_space_x[v] = x;
-                _Model.vertex_view_space_y[v] = temp;
-                _Model.vertex_view_space_z[v] = z;
-            }
-#ifdef GL11
+        if (project || m->textured_face_count > 0) {
+            _Model.vertex_view_space_x[v] = x;
+            _Model.vertex_view_space_y[v] = temp;
+            _Model.vertex_view_space_z[v] = z;
         }
-#endif
     }
     // try {
+#ifdef GL11
+    if(_Custom.use_opengl11) {
+        if(m->face_count<0 || (unsigned)m->face_count>UINT32_MAX/3u){fprintf(stderr,"HW_R3_INVALID_FACE_COUNT\n");abort();}
+        gl_reserve_geometry((unsigned)m->face_count*3u,(unsigned)m->face_count*3u);
+    }
+#endif
+#ifdef GL11
+    r10_model_indices(elementcount);
+#endif
+#if BA_R10_CACHE
+    uint64_t r10_project_us=ba_timing_now()-r10_project_at,r10_faces_at=ba_timing_now();
+    unsigned r10_selected_before=(unsigned)elementcount;
+#endif
     model_draw2(m, project, hasInput, key);
+#if BA_R10_CACHE
+    r10_model_work(r10_project_us,ba_timing_now()-r10_faces_at,(unsigned)m->vertex_count,(unsigned)elementcount-r10_selected_before);
+#endif
     // } catch ( Exception ignored) {
+    if (r16_suppress_emit()) return;
     gl_start_model(m, sceneX, sceneY, sceneZ, yaw);
 }
 
 void model_draw2(Model *m, bool projected, bool hasInput, int bitset) {
+ R11_SCOPE(R11_ORDER);
+    /* Hover needs the same first eligible face hit, but never the depth
+     * buckets, priority sorting or suppressed draw-face calls below. */
+    if (r16_suppress_emit()) {
+        if (!hasInput) return;
+        for (int f = 0; f < m->face_count; f++) {
+            if (m->face_infos && m->face_infos[f] == -1) continue;
+            int a=m->face_indices_a[f],b=m->face_indices_b[f],c=m->face_indices_c[f];
+            int xa=_Model.vertex_screen_x[a],xb=_Model.vertex_screen_x[b],xc=_Model.vertex_screen_x[c];
+            if (projected && (xa == -5000 || xb == -5000 || xc == -5000)) continue;
+            if (model_point_within_triangle(_Model.mouse_x,_Model.mouse_y,_Model.vertex_screen_y[a],_Model.vertex_screen_y[b],_Model.vertex_screen_y[c],xa,xb,xc)) {
+                if (_Model.picked_count < 1000) _Model.picked_bitsets[_Model.picked_count++] = bitset;
+                return;
+            }
+        }
+        return;
+    }
     // added < MODEL_MAX_DEPTH checks for model 714 and for optional smaller depth buffer
     for (int i = 0; i < m->max_depth && i < MODEL_MAX_DEPTH; i++) {
         _Model.tmp_depth_face_count[i] = 0;
@@ -1108,7 +1214,7 @@ void model_draw2(Model *m, bool projected, bool hasInput, int bitset) {
                 }
             } else {
                 if (hasInput && model_point_within_triangle(_Model.mouse_x, _Model.mouse_y, _Model.vertex_screen_y[a], _Model.vertex_screen_y[b], _Model.vertex_screen_y[c], xa, xb, xc)) {
-                    _Model.picked_bitsets[_Model.picked_count++] = bitset;
+                    if (_Model.picked_count < 1000) _Model.picked_bitsets[_Model.picked_count++] = bitset;
                     hasInput = false;
                 }
 
@@ -1252,8 +1358,10 @@ void model_draw2(Model *m, bool projected, bool hasInput, int bitset) {
 }
 
 void model_draw_face(Model *m, int index) {
+    if (r16_suppress_emit()) return;
 #ifdef GL11
     if (_Custom.use_opengl11) {
+        gl_reserve_geometry((unsigned)index*3u+3u,3);
         int start = vertcount + index * 3;
         indices[elementcount++] = start;
         indices[elementcount++] = start + 1;
@@ -1482,7 +1590,8 @@ bool model_point_within_triangle(int x, int y, int ya, int yb, int yc, int xa, i
 }
 
 void model_calculate_normals(Model *m, int light_ambient, int light_attenuation, int lightsrc_x, int lightsrc_y, int lightsrc_z, bool apply_lighting, bool use_allocator) {
-    const int lightMagnitude = (int)SQRT(lightsrc_x * lightsrc_x + lightsrc_y * lightsrc_y + lightsrc_z * lightsrc_z);
+    r10_model_changed_mask(m,0xf1);
+    const int lightMagnitude = (int)sqrt(lightsrc_x * lightsrc_x + lightsrc_y * lightsrc_y + lightsrc_z * lightsrc_z);
     const int attenuation = light_attenuation * lightMagnitude >> 8;
 
     if (!m->face_color_a) {
@@ -1517,7 +1626,7 @@ void model_calculate_normals(Model *m, int light_ambient, int light_attenuation,
             ny >>= 0x1;
             nz >>= 0x1;
         }
-        int length = (int)SQRT((DOUBLE)(nx * nx + ny * ny + nz * nz));
+        int length = (int)sqrt((double)(nx * nx + ny * ny + nz * nz));
         if (length <= 0) {
             length = 1;
         }
@@ -1582,9 +1691,9 @@ void model_calculate_bounds_cylinder(Model *m) {
             m->radius = radius_sqr;
         }
     }
-    m->radius = (int)(SQRT((DOUBLE)m->radius) + 0.99);
-    m->min_depth = (int)(SQRT((DOUBLE)(m->radius * m->radius + m->max_y * m->max_y)) + 0.99);
-    m->max_depth = m->min_depth + (int)(SQRT((DOUBLE)(m->radius * m->radius + m->min_y * m->min_y)) + 0.99);
+    m->radius = (int)(sqrt((double)m->radius) + 0.99);
+    m->min_depth = (int)(sqrt((double)(m->radius * m->radius + m->max_y * m->max_y)) + 0.99);
+    m->max_depth = m->min_depth + (int)(sqrt((double)(m->radius * m->radius + m->min_y * m->min_y)) + 0.99);
 }
 
 void model_create_label_references(Model *m, bool use_allocator) {
@@ -1649,6 +1758,9 @@ void model_create_label_references(Model *m, bool use_allocator) {
 }
 
 void model_apply_transform(Model *m, int id) {
+    if(id!=-1)m->r10_animated=true;
+    r10_model_changed_mask(m,0x10f);
+    BA_PROFILE_SCOPE(BA_MODEL);
     if (m->label_vertices && id != -1) {
         AnimFrame *frame = _AnimFrame.instances[id];
         AnimBase *base = frame->base;
@@ -1665,6 +1777,9 @@ void model_apply_transform(Model *m, int id) {
 }
 
 void model_apply_transforms(Model *m, int id, int id2, int *walkmerge) {
+    if(id!=-1)m->r10_animated=true;
+    r10_model_changed_mask(m,0x10f);
+    BA_PROFILE_SCOPE(BA_MODEL);
     if (id == -1) {
         return;
     }
@@ -1715,6 +1830,7 @@ void model_apply_transforms(Model *m, int id, int id2, int *walkmerge) {
 }
 
 void model_apply_transform2(Model *m, int x, int y, int z, int *labels, int labels_count, int type) {
+    r10_model_changed_mask(m,0x10f);
     if (type == OP_BASE) {
         int count = 0;
         _Model.base_x = 0;
@@ -1858,6 +1974,7 @@ void model_apply_transform2(Model *m, int x, int y, int z, int *labels, int labe
 }
 
 void model_rotate_y90(Model *m) {
+    r10_model_changed_mask(m,0xf);
     for (int v = 0; v < m->vertex_count; v++) {
         int tmp = m->vertices_x[v];
         m->vertices_x[v] = m->vertices_z[v];
@@ -1866,6 +1983,7 @@ void model_rotate_y90(Model *m) {
 }
 
 void model_rotate_x(Model *m, int angle) {
+    r10_model_changed_mask(m,0xf);
     int sin = _Pix3D.sin_table[angle];
     int cos = _Pix3D.cos_table[angle];
     for (int v = 0; v < m->vertex_count; v++) {
@@ -1876,6 +1994,7 @@ void model_rotate_x(Model *m, int angle) {
 }
 
 void model_translate(Model *m, int y, int x, int z) {
+    r10_model_changed_mask(m,0xf);
     for (int v = 0; v < m->vertex_count; v++) {
         m->vertices_x[v] += x;
         m->vertices_y[v] += y;
@@ -1884,6 +2003,7 @@ void model_translate(Model *m, int y, int x, int z) {
 }
 
 void model_recolor(Model *m, int src, int dst) {
+    r10_model_changed_mask(m,0x201);
     for (int f = 0; f < m->face_count; f++) {
         if (m->face_colors[f] == src) {
             m->face_colors[f] = dst;
@@ -1892,6 +2012,7 @@ void model_recolor(Model *m, int src, int dst) {
 }
 
 void model_rotate_y180(Model *m) {
+    r10_model_changed_mask(m,0xc40f);
     for (int v = 0; v < m->vertex_count; v++) {
         m->vertices_z[v] = -m->vertices_z[v];
     }
@@ -1904,6 +2025,7 @@ void model_rotate_y180(Model *m) {
 }
 
 void model_scale(Model *m, int x, int y, int z) {
+    r10_model_changed_mask(m,0xf);
     for (int v = 0; v < m->vertex_count; v++) {
         m->vertices_x[v] = m->vertices_x[v] * x / 128;
         m->vertices_y[v] = m->vertices_y[v] * y / 128;
@@ -1925,8 +2047,8 @@ void model_calculate_bounds_y(Model *m) {
         }
     }
 
-    m->min_depth = (int)(SQRT(m->radius * m->radius + m->max_y * m->max_y) + 0.99);
-    m->max_depth = m->min_depth + (int)(SQRT(m->radius * m->radius + m->min_y * m->min_y) + 0.99);
+    m->min_depth = (int)(sqrt(m->radius * m->radius + m->max_y * m->max_y) + 0.99);
+    m->max_depth = m->min_depth + (int)(sqrt(m->radius * m->radius + m->min_y * m->min_y) + 0.99);
 }
 
 void model_calculate_bounds_aabb(Model *m) {
@@ -1964,9 +2086,9 @@ void model_calculate_bounds_aabb(Model *m) {
             m->radius = radius_sqr;
         }
     }
-    m->radius = (int)SQRT((DOUBLE)m->radius);
-    m->min_depth = (int)SQRT((DOUBLE)(m->radius * m->radius + m->max_y * m->max_y));
-    m->max_depth = m->min_depth + (int)SQRT((DOUBLE)(m->radius * m->radius + m->min_y * m->min_y));
+    m->radius = (int)sqrt((double)m->radius);
+    m->min_depth = (int)sqrt((double)(m->radius * m->radius + m->max_y * m->max_y));
+    m->max_depth = m->min_depth + (int)sqrt((double)(m->radius * m->radius + m->min_y * m->min_y));
 }
 
 int model_mul_color_lightness(int hsl, int scalar, int face_infos) {
@@ -1988,6 +2110,7 @@ int model_mul_color_lightness(int hsl, int scalar, int face_infos) {
 }
 
 void model_apply_lighting(Model *m, int light_ambient, int light_attenuation, int lightsrc_x, int lightsrc_y, int lightsrc_z, bool _free) {
+    r10_model_changed_mask(m,0xf1);
     for (int f = 0; f < m->face_count; f++) {
         int a = m->face_indices_a[f];
         int b = m->face_indices_b[f];

@@ -4,13 +4,15 @@
 #include "defines.h"
 #include "idktype.h"
 #include "model.h"
+#include "r98_cape_fit.h"
+#include "r57_body_layers.h"
 #include "objtype.h"
 #include "packet.h"
 #include "pathingentity.h"
 #include "seqtype.h"
 #include "spotanimtype.h"
-#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern IdkTypeData _IdkType;
 extern SeqTypeData _SeqType;
@@ -21,7 +23,7 @@ int DESIGN_HAIR_COLOR[] = {
 
 int *DESIGN_BODY_COLOR[] = {
     // hair
-    (int[]){BODY_RECOLOR_KHAKI, BODY_RECOLOR_CHARCOAL, BODY_RECOLOR_CRIMSON, BODY_RECOLOR_NAVY, BODY_RECOLOR_STRAW, BODY_RECOLOR_WHITE, BODY_RECOLOR_RED, BODY_RECOLOR_BLUE, BODY_RECOLOR_GREEN, BODY_RECOLOR_YELLOW, BODY_RECOLOR_PURPLE, BODY_RECOLOR_ORANGE, BODY_RECOLOR_ROSE, BODY_RECOLOR_LIME, BODY_RECOLOR_CYAN, BODY_RECOLOR_EMERALD},
+    (int[]){6798, 107, 10283, 16, 4797, 7744, 5799, 4634, 33697, 22433, 2983, 54193},
     // torso
     (int[]){BODY_KHAKI, BODY_CHARCOAL, BODY_CRIMSON, BODY_NAVY, BODY_STRAW, BODY_WHITE, BODY_RED, BODY_BLUE, BODY_GREEN, BODY_YELLOW, BODY_PURPLE, BODY_ORANGE, BODY_ROSE, BODY_LIME, BODY_CYAN, BODY_EMERALD},
     // legs
@@ -31,7 +33,7 @@ int *DESIGN_BODY_COLOR[] = {
     // skin
     (int[]){SKIN_DARKER, SKIN_DARKER_DARKER, SKIN_DARKER_DARKER_DARKER, SKIN_DARKER_DARKER_DARKER_DARKER, SKIN_DARKER_DARKER_DARKER_DARKER_DARKER, SKIN_DARKER_DARKER_DARKER_DARKER_DARKER_DARKER, SKIN_DARKER_DARKER_DARKER_DARKER_DARKER_DARKER_DARKER, SKIN}};
 
-int DESIGN_BODY_COLOR_LENGTH[] = {16, 16, 16, 6, 8};
+int DESIGN_BODY_COLOR_LENGTH[] = {12, 16, 16, 6, 8};
 
 PlayerEntityData _PlayerEntity = {0};
 
@@ -110,7 +112,7 @@ void playerentity_read(PlayerEntity *entity, Packet *buf) {
     }
 
     char* name = jstring_format_name(jstring_from_base37(g8(buf)));
-    snprintf(entity->name, sizeof(entity->name), "%s", name);
+    strcpy(entity->name, name);
     free(name);
     entity->combatLevel = g1(buf);
 
@@ -148,7 +150,7 @@ Model *playerentity_draw(PlayerEntity *entity, int loopCycle) {
 
     Model *model = playerentity_get_sequencedmodel(entity);
     entity->pathing_entity.height = model->max_y;
-    model->pick_aabb = true;
+    model->pickable = true;
 
     if (entity->lowmem) {
         return model;
@@ -218,7 +220,7 @@ Model *playerentity_draw(PlayerEntity *entity, int loopCycle) {
         }
     }
 
-    model->pick_aabb = true;
+    model->pickable = true;
     return model;
 }
 
@@ -254,6 +256,7 @@ Model *playerentity_get_sequencedmodel(PlayerEntity *entity) {
     if (!model) {
         Model *models[12] = {0};
         int modelCount = 0;
+        Model *fireCapeFit=NULL,*torsoFit=NULL,*legsFit=NULL;
 
         for (int part = 0; part < 12; part++) {
             int value = entity->appearances[part];
@@ -275,11 +278,15 @@ Model *playerentity_get_sequencedmodel(PlayerEntity *entity) {
                 Model *wornModel = objtype_get_wornmodel(obj, entity->gender);
 
                 if (wornModel) {
+                    if(part==1&&value-512==2889)fireCapeFit=wornModel;
+                    if(part==4)torsoFit=wornModel;
+                    if(part==7)legsFit=wornModel;
                     models[modelCount++] = wornModel;
                 }
             }
         }
 
+        r98_fit_cape(fireCapeFit,torsoFit,legsFit);
         model = model_from_models(models, modelCount, true);
         for (int part = 0; part < 12; part++) {
             if (models[part]) {
@@ -299,6 +306,7 @@ Model *playerentity_get_sequencedmodel(PlayerEntity *entity) {
 
         model_create_label_references(model, true);
         model_calculate_normals(model, 64, 850, -30, -50, -30, true, true);
+        r57_prepare_body_layers(model);
         lrucache_put(_PlayerEntity.modelCache, hashCode, &model->link);
     }
 

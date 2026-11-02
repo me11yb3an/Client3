@@ -15,6 +15,8 @@ typedef struct {
     SeqType *seq;
     int seqFrame;
     int seqCycle;
+    bool ambient_half;
+    unsigned ambient_remainder;
 } LocEntity;
 
 LocEntity *locentity_new(int index, int level, int type, int x, int z, SeqType *seq, bool randomFrame);

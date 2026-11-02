@@ -1,3 +1,4 @@
+#include "ba_hw_r5.h"
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
@@ -123,14 +124,15 @@ void platform_set_font(const char *name, bool bold, int size) {
 #elif ANDROID
         file = SDL_RWFromFile("Roboto/Roboto-Bold.ttf", "rb");
 #else
-        file = fopen("rom/Roboto/Roboto-Bold.ttf", "rb");
+        file = fopen("Roboto/Roboto-Bold.ttf", "rb");
 #endif
         if (!file) {
 #ifdef _WIN32
             file = fopen("c:/reactos/fonts/arialbd.ttf", "rb");
 #endif
             if (!file) {
-                file = fopen("Roboto/Roboto-Bold.ttf", "rb");
+                // last try for desktop without system fonts found, where /rom isn't root in romfs
+                file = fopen("rom/Roboto/Roboto-Bold.ttf", "rb");
                 if (!file) {
                     // TODO: won't show errors on screen if no font, try use native text drawing for all platforms if no system font or Roboto
                     rs2_error("Failed to open font file\n");
@@ -292,9 +294,17 @@ void rs2_error(const char *format, ...) {
 }
 
 // Java Math.random, rand requires + 1 to never reach 1 else it'll overflow on update_flame_buffer
-DOUBLE jrand(void) {
-    return (DOUBLE)rand() / ((DOUBLE)RAND_MAX + 1.0);
+#ifdef USE_FLOATS
+double jrand(void) {
+    if(h5_requested_run())return h5_random();
+    return (float)rand() / ((float)RAND_MAX + 1.0);
 }
+#else
+double jrand(void) {
+    if(h5_requested_run())return h5_random();
+    return (double)rand() / ((double)RAND_MAX + 1.0);
+}
+#endif
 
 // Java indexOf
 int indexof_chr(const char *str, int chr) {

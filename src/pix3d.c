@@ -1,24 +1,39 @@
+#include "vita_wide_layout.h"
 #include <math.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "pix3d.h"
+
+// Fail closed if the texture/sprite allocation cannot be satisfied. No output change on success.
+static void *pix3d_checked_alloc(size_t count, size_t size, bool clear) {
+    void *memory = clear ? calloc(count, size) : malloc(count * size);
+    if (!memory && count && size) {
+        fprintf(stderr, "pix3d.c: allocation failed\n");
+        abort();
+    }
+    return memory;
+}
+
 #include "custom.h"
 #include "pix8.h"
 #include "platform.h"
 #include "gl11.h"
 
+enum { TEMPLE_TEXTURE_CAPACITY = 58 };
+
 Pix3D _Pix3D = {.lowMemory = true, .jagged = true};
 extern Pix2D _Pix2D;
 
 void pix3d_init_global(void) {
-    _Pix3D.reciprical15 = malloc(512 * sizeof(int));
-    _Pix3D.reciprical16 = malloc(2048 * sizeof(int));
-    _Pix3D.sin_table = malloc(2048 * sizeof(int));
-    _Pix3D.cos_table = malloc(2048 * sizeof(int));
-    _Pix3D.renderWidth = 512;
-    _Pix3D.renderHeight = 334;
+    _Pix3D.reciprical15 = pix3d_checked_alloc(1, 512 * sizeof(int), false);
+    _Pix3D.reciprical16 = pix3d_checked_alloc(1, 2048 * sizeof(int), false);
+    _Pix3D.sin_table = pix3d_checked_alloc(1, 2048 * sizeof(int), false);
+    _Pix3D.cos_table = pix3d_checked_alloc(1, 2048 * sizeof(int), false);
+    _Pix3D.renderWidth = GAME_VIEW_WIDTH;
+    _Pix3D.renderHeight = GAME_VIEW_HEIGHT;
 
     for (int i = 1; i < 512; i++) {
         _Pix3D.reciprical15[i] = 32768 / i;
@@ -27,16 +42,16 @@ void pix3d_init_global(void) {
         _Pix3D.reciprical16[i] = 65536 / i;
     }
     for (int i = 0; i < 2048; i++) {
-        _Pix3D.sin_table[i] = (int)(SIN((DOUBLE)i * 0.0030679615) * 65536.0);
-        _Pix3D.cos_table[i] = (int)(COS((DOUBLE)i * 0.0030679615) * 65536.0);
+        _Pix3D.sin_table[i] = (int)(sin((double)i * 0.0030679615) * 65536.0);
+        _Pix3D.cos_table[i] = (int)(cos((double)i * 0.0030679615) * 65536.0);
     }
-    _Pix3D.textures = calloc(50, sizeof(Pix8 *));
-    _Pix3D.textureHasTransparency = calloc(50, sizeof(bool));
-    _Pix3D.textureColors = calloc(50, sizeof(int));
-    _Pix3D.activeTexels = calloc(50, sizeof(int *));
-    _Pix3D.textureCycle = calloc(50, sizeof(int));
-    _Pix3D.palette = calloc(65536, sizeof(int));
-    _Pix3D.texturePalettes = calloc(50, sizeof(int *));
+    _Pix3D.textures = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(Pix8 *), true);
+    _Pix3D.textureHasTransparency = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(bool), true);
+    _Pix3D.textureColors = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(int), true);
+    _Pix3D.activeTexels = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(int *), true);
+    _Pix3D.textureCycle = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(int), true);
+    _Pix3D.palette = pix3d_checked_alloc(65536, sizeof(int), true);
+    _Pix3D.texturePalettes = pix3d_checked_alloc(TEMPLE_TEXTURE_CAPACITY, sizeof(int *), true);
 }
 
 void pix3d_free_global(void) {
@@ -45,8 +60,8 @@ void pix3d_free_global(void) {
     }
     free(_Pix3D.texelPool);
 
-    for (int i = 0; i < 50; i++) {
-        pix8_free(_Pix3D.textures[i]);
+    for (int i = 0; i < TEMPLE_TEXTURE_CAPACITY; i++) {
+        if (_Pix3D.textures[i]) pix8_free(_Pix3D.textures[i]);
         free(_Pix3D.texturePalettes[i]);
         free(_Pix3D.activeTexels[i]);
     }
@@ -64,7 +79,7 @@ void pix3d_free_global(void) {
 }
 
 void pix3d_init2d(void) {
-    _Pix3D.line_offset = malloc(_Pix2D.height * sizeof(int));
+    _Pix3D.line_offset = pix3d_checked_alloc(1, _Pix2D.height * sizeof(int), false);
     for (int y = 0; y < _Pix2D.height; y++) {
         _Pix3D.line_offset[y] = _Pix2D.width * y;
     }
@@ -73,7 +88,7 @@ void pix3d_init2d(void) {
 }
 
 void pix3d_init3d(int width, int height) {
-    _Pix3D.line_offset = malloc(height * sizeof(int));
+    _Pix3D.line_offset = pix3d_checked_alloc(1, height * sizeof(int), false);
     for (int y = 0; y < height; y++) {
         _Pix3D.line_offset[y] = width * y;
     }
@@ -89,7 +104,7 @@ void pix3d_clear_texels(void) {
     free(_Pix3D.texelPool);
     _Pix3D.texelPool = NULL;
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < TEMPLE_TEXTURE_CAPACITY; i++) {
         free(_Pix3D.activeTexels[i]);
         _Pix3D.activeTexels[i] = NULL;
     }
@@ -101,27 +116,33 @@ void pix3d_init_pool(int size) {
     }
     _Pix3D.poolSize = size;
     if (_Pix3D.lowMemory) {
-        _Pix3D.texelPool = malloc(_Pix3D.poolSize * sizeof(int *));
+        _Pix3D.texelPool = pix3d_checked_alloc(1, _Pix3D.poolSize * sizeof(int *), false);
         for (int i = 0; i < _Pix3D.poolSize; i++) {
-            _Pix3D.texelPool[i] = calloc(16384, sizeof(int));
+            _Pix3D.texelPool[i] = pix3d_checked_alloc(16384, sizeof(int), true);
         }
     } else {
-        _Pix3D.texelPool = malloc(_Pix3D.poolSize * sizeof(int *));
+        _Pix3D.texelPool = pix3d_checked_alloc(1, _Pix3D.poolSize * sizeof(int *), false);
         for (int i = 0; i < _Pix3D.poolSize; i++) {
-            _Pix3D.texelPool[i] = calloc(65536, sizeof(int));
+            _Pix3D.texelPool[i] = pix3d_checked_alloc(65536, sizeof(int), true);
         }
     }
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < TEMPLE_TEXTURE_CAPACITY; i++) {
         _Pix3D.activeTexels[i] = NULL;
     }
 }
 
 void pix3d_unpack_textures(Jagfile *jag) {
     _Pix3D.textureCount = 0;
-    for (int id = 0; id < 50; id++) {
+    for (int id = 0; id < TEMPLE_TEXTURE_CAPACITY; id++) {
         // try {
-        char name[3];
+        char name[4], entry[12];
         snprintf(name, sizeof(name), "%d", id);
+        snprintf(entry, sizeof(entry), "%d.dat", id);
+        uint32_t hash = 0;
+        for (int n = 0; entry[n]; n++) hash = hash * 61 + (unsigned char)toupper((unsigned char)entry[n]) - 32;
+        bool found = false;
+        for (int n = 0; n < jag->file_count; n++) if ((uint32_t)jag->file_hash[n] == hash) { found = true; break; }
+        if (!found) break; // Baseline has 51 textures; the separate temple candidate has 54.
         _Pix3D.textures[id] = pix8_from_archive(jag, name, 0);
         if (_Pix3D.lowMemory && _Pix3D.textures[id]->crop_w == 128) {
             pix8_shrink(_Pix3D.textures[id]);
@@ -230,30 +251,30 @@ int *pix3d_get_texels(int id) {
     return texels;
 }
 
-void pix3d_set_brightness(DOUBLE brightness) {
-    DOUBLE random_brightness = brightness + jrand() * 0.03 - 0.015;
+void pix3d_set_brightness(double brightness) {
+    double random_brightness = brightness + jrand() * 0.03 - 0.015;
     int offset = 0;
     for (int y = 0; y < 512; y++) {
-        DOUBLE hue = (DOUBLE)(y / 8) / 64.0 + 0.0078125;
-        DOUBLE saturation = (DOUBLE)(y & 0x7) / 8.0 + 0.0625;
+        double hue = (double)(y / 8) / 64.0 + 0.0078125;
+        double saturation = (double)(y & 0x7) / 8.0 + 0.0625;
         for (int x = 0; x < 128; x++) {
-            DOUBLE lightness = (DOUBLE)x / 128.0;
-            DOUBLE r = lightness;
-            DOUBLE g = lightness;
-            DOUBLE b = lightness;
+            double lightness = (double)x / 128.0;
+            double r = lightness;
+            double g = lightness;
+            double b = lightness;
             if (saturation != 0.0) {
-                DOUBLE q;
+                double q;
                 if (lightness < 0.5) {
                     q = lightness * (saturation + 1.0);
                 } else {
                     q = lightness + saturation - lightness * saturation;
                 }
-                DOUBLE p = lightness * 2.0 - q;
-                DOUBLE t = hue + 0.3333333333333333;
+                double p = lightness * 2.0 - q;
+                double t = hue + 0.3333333333333333;
                 if (t > 1.0) {
                     t--;
                 }
-                DOUBLE d11 = hue - 0.3333333333333333;
+                double d11 = hue - 0.3333333333333333;
                 if (d11 < 0.0) {
                     d11++;
                 }
@@ -293,36 +314,51 @@ void pix3d_set_brightness(DOUBLE brightness) {
             _Pix3D.palette[offset++] = rgbAdjusted;
         }
     }
-    for (int id = 0; id < 50; id++) {
+    for (int id = 0; id < TEMPLE_TEXTURE_CAPACITY; id++) {
         if (_Pix3D.textures[id]) {
             int palette_count = _Pix3D.textures[id]->palette_count;
             int *palette = _Pix3D.textures[id]->palette;
             free(_Pix3D.texturePalettes[id]);
-            _Pix3D.texturePalettes[id] = calloc(palette_count, sizeof(int));
+            _Pix3D.texturePalettes[id] = pix3d_checked_alloc(palette_count, sizeof(int), true);
             for (int i = 0; i < palette_count; i++) {
                 _Pix3D.texturePalettes[id][i] = pix3d_set_gamma(palette[i], random_brightness);
             }
         }
     }
-    for (int id = 0; id < 50; id++) {
+    for (int id = 0; id < TEMPLE_TEXTURE_CAPACITY; id++) {
         pix3d_push_texture(id);
     }
 
     gl_set_brightness();
 }
 
-int pix3d_set_gamma(int rgb, DOUBLE gamma) {
-    DOUBLE r = (DOUBLE)(rgb >> 16) / 256.0;
-    DOUBLE g = (DOUBLE)(rgb >> 8 & 0xff) / 256.0;
-    DOUBLE b = (DOUBLE)(rgb & 0xff) / 256.0;
-    DOUBLE powR = POW(r, gamma);
-    DOUBLE powG = POW(g, gamma);
-    DOUBLE powB = POW(b, gamma);
+#ifdef USE_FLOATS
+int pix3d_set_gamma(int rgb, double gamma) {
+    float r = (float)(rgb >> 16) / 256.0f;
+    float g = (float)(rgb >> 8 & 0xff) / 256.0f;
+    float b = (float)(rgb & 0xff) / 256.0f;
+    float powR = powf(r, gamma);
+    float powG = powf(g, gamma);
+    float powB = powf(b, gamma);
+    int intR = (int)(powR * 256.0f);
+    int intG = (int)(powG * 256.0f);
+    int intB = (int)(powB * 256.0f);
+    return (intR << 16) + (intG << 8) + intB;
+}
+#else
+int pix3d_set_gamma(int rgb, double gamma) {
+    double r = (double)(rgb >> 16) / 256.0;
+    double g = (double)(rgb >> 8 & 0xff) / 256.0;
+    double b = (double)(rgb & 0xff) / 256.0;
+    double powR = pow(r, gamma);
+    double powG = pow(g, gamma);
+    double powB = pow(b, gamma);
     int intR = (int)(powR * 256.0);
     int intG = (int)(powG * 256.0);
     int intB = (int)(powB * 256.0);
     return (intR << 16) + (intG << 8) + intB;
 }
+#endif
 
 static void gouraudRaster(int x0, int x1, int color0, int color1, int *dst, int offset, int length) {
     int rgb;

@@ -1,3 +1,6 @@
+#include "r10_scene.h"
+#include "ba_timing.h"
+extern void ba_cadence_diagnostic(const char *line);
 #include <limits.h>
 #include <math.h>
 #include <stdio.h>
@@ -16,6 +19,7 @@
 #include "seqtype.h"
 #include "world.h"
 #include "world3d.h"
+#include "r25_wall_decor.h"
 
 extern Pix3D _Pix3D;
 extern FloTypeData _FloType;
@@ -81,7 +85,7 @@ void world_free(World *world) {
 
 int perlinNoise(int x, int z) {
     int value = interpolatedNoise(x + 45365, z + 91923, 4) + ((interpolatedNoise(x + 10294, z + 37821, 2) - 128) >> 1) + ((interpolatedNoise(x, z, 1) - 128) >> 2) - 128;
-    value = (int)((DOUBLE)value * 0.3) + 35;
+    value = (int)((double)value * 0.3) + 35;
     if (value < 10) {
         value = 10;
     } else if (value > 60) {
@@ -131,6 +135,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
     int y = (heightSW + heightSE + heightNW + heightNE) >> 2;
 
     LocType *loc = loctype_get(locId);
+    LocType *visual = loctype_visual_for_scene(loc,level,x,z,shape,rotation);
     int bitset = x + (z << 7) + (locId << 14) + 0x40000000;
     if (!loc->active) {
         bitset += INT_MIN;
@@ -143,8 +148,10 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
     Model *model2;
 
     if (shape == GROUNDDECOR) {
-        model1 = loctype_get_model(loc, GROUNDDECOR, rotation, heightSW, heightSE, heightNE, heightNW, -1);
-        world3d_add_grounddecoration(scene, model1, level, x, z, y, bitset, info);
+        if (!loctype_visual_hidden_for_scene(loc,level,x,z,shape,rotation)) {
+            model1 = loctype_get_model(visual, GROUNDDECOR, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+            world3d_add_grounddecoration(scene, model1, level, x, z, y, bitset, info);
+        }
 
         if (loc->blockwalk && loc->active) {
             collisionmap_set_blocked(collision, x, z);
@@ -154,7 +161,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 3, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == CENTREPIECE_STRAIGHT || shape == CENTREPIECE_DIAGONAL) {
-        model1 = loctype_get_model(loc, CENTREPIECE_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, CENTREPIECE_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         if (model1) {
             int yaw = 0;
             if (shape == CENTREPIECE_DIAGONAL) {
@@ -181,7 +188,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape >= ROOF_STRAIGHT) {
-        model1 = loctype_get_model(loc, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_loc(scene, level, x, z, y, model1, NULL, bitset, info, 1, 1, 0);
 
         if (loc->blockwalk) {
@@ -192,7 +199,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_STRAIGHT) {
-        model1 = loctype_get_model(loc, WALL_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALL_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_TYPE[rotation], 0, model1, NULL, bitset, info);
 
         if (loc->blockwalk) {
@@ -203,7 +210,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 0, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_DIAGONALCORNER) {
-        model1 = loctype_get_model(loc, WALL_DIAGONALCORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALL_DIAGONALCORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_CORNER_TYPE[rotation], 0, model1, NULL, bitset, info);
 
         if (loc->blockwalk) {
@@ -215,8 +222,8 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
         }
     } else if (shape == WALL_L) {
         int nextRotation = rotation + 1 & 0x3;
-        Model *model3 = loctype_get_model(loc, WALL_L, rotation + 4, heightSW, heightSE, heightNE, heightNW, -1);
-        model2 = loctype_get_model(loc, WALL_L, nextRotation, heightSW, heightSE, heightNE, heightNW, -1);
+        Model *model3 = loctype_get_model(visual, WALL_L, rotation + 4, heightSW, heightSE, heightNE, heightNW, -1);
+        model2 = loctype_get_model(visual, WALL_L, nextRotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_TYPE[rotation], ROTATION_WALL_TYPE[nextRotation], model3, model2, bitset, info);
 
         if (loc->blockwalk) {
@@ -227,7 +234,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 0, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_SQUARECORNER) {
-        model1 = loctype_get_model(loc, WALL_SQUARECORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALL_SQUARECORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_CORNER_TYPE[rotation], 0, model1, NULL, bitset, info);
 
         if (loc->blockwalk) {
@@ -238,7 +245,7 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 0, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_DIAGONAL) {
-        model1 = loctype_get_model(loc, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_loc(scene, level, x, z, y, model1, NULL, bitset, info, 1, 1, 0);
 
         if (loc->blockwalk) {
@@ -249,8 +256,9 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_STRAIGHT_NOOFFSET) {
-        model1 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
-        world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model1, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
+        model1 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        /* Window fitting is intentionally separate from ordinary decorations. */
+        world3d_set_walldecoration(scene, level, x, z, y, WALL_DECORATION_ROTATION_FORWARD_X[rotation] * r25_straight_decor_inset(locId), WALL_DECORATION_ROTATION_FORWARD_Z[rotation] * r25_straight_decor_inset(locId), bitset, model1, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
@@ -262,29 +270,30 @@ void world_add_loc(int level, int x, int z, World3D *scene, int (*levelHeightmap
         if (width > 0) {
             offset = loctype_get(width >> 14 & 0x7fff)->wallwidth;
         }
+        offset += r25_offset_decor_extra(locId);
 
-        model2 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model2 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, WALL_DECORATION_ROTATION_FORWARD_X[rotation] * offset, WALL_DECORATION_ROTATION_FORWARD_Z[rotation] * offset, bitset, model2, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_OFFSET) {
-        model1 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model1, info, rotation, 256);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_NOOFFSET) {
-        model1 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model1, info, rotation, 512);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_BOTH) {
-        model1 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model1, info, rotation, 768);
 
         if (loc->anim != -1) {
@@ -319,6 +328,7 @@ void clearLandscape(World *world, int startX, int startZ, int endX, int endZ) {
 }
 
 void world_load_ground(World *world, int originX, int originZ, int xOffset, int zOffset, int8_t *src, int src_len) {
+    r10_reset();
     Packet *buf = packet_new(src, src_len);
 
     for (int level = 0; level < 4; level++) {
@@ -454,6 +464,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
     int y = (heightSW + heightSE + heightNW + heightNE) >> 2;
 
     LocType *loc = loctype_get(locId);
+    LocType *visual = loctype_visual_for_scene(loc,level,x,z,shape,rotation);
     int bitset = x + (z << 7) + (locId << 14) + 0x40000000;
     if (!loc->active) {
         bitset += INT_MIN;
@@ -470,8 +481,10 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             return;
         }
 
-        model = loctype_get_model(loc, GROUNDDECOR, rotation, heightSW, heightSE, heightNE, heightNW, -1);
-        world3d_add_grounddecoration(scene, model, level, x, z, y, bitset, info);
+        if (!loctype_visual_hidden_for_scene(loc,level,x,z,shape,rotation)) {
+            model = loctype_get_model(visual, GROUNDDECOR, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+            world3d_add_grounddecoration(scene, model, level, x, z, y, bitset, info);
+        }
 
         if (loc->blockwalk && loc->active && collision) {
             collisionmap_set_blocked(collision, x, z);
@@ -481,7 +494,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             linklist_add_tail(locs, &locentity_new(locId, level, 3, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == CENTREPIECE_STRAIGHT || shape == CENTREPIECE_DIAGONAL) {
-        model = loctype_get_model(loc, CENTREPIECE_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, CENTREPIECE_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
 
         if (model) {
             int yaw = 0;
@@ -522,7 +535,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape >= ROOF_STRAIGHT) {
-        model = loctype_get_model(loc, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_loc(scene, level, x, z, y, model, NULL, bitset, info, 1, 1, 0);
 
         if (shape >= ROOF_STRAIGHT && shape <= ROOF_FLAT && shape != ROOF_DIAGONAL_WITH_ROOFEDGE && level > 0) {
@@ -537,7 +550,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_STRAIGHT) {
-        model = loctype_get_model(loc, WALL_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALL_STRAIGHT, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_TYPE[rotation], 0, model, NULL, bitset, info);
 
         if (rotation == 0) {
@@ -590,7 +603,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             world3d_set_walldecorationoffset(scene, level, x, z, loc->wallwidth);
         }
     } else if (shape == WALL_DIAGONALCORNER) {
-        model = loctype_get_model(loc, WALL_DIAGONALCORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALL_DIAGONALCORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_CORNER_TYPE[rotation], 0, model, NULL, bitset, info);
 
         if (loc->shadow) {
@@ -614,8 +627,8 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
         }
     } else if (shape == WALL_L) {
         int nextRotation = rotation + 1 & 0x3;
-        Model *model3 = loctype_get_model(loc, WALL_L, rotation + 4, heightSW, heightSE, heightNE, heightNW, -1);
-        model1 = loctype_get_model(loc, WALL_L, nextRotation, heightSW, heightSE, heightNE, heightNW, -1);
+        Model *model3 = loctype_get_model(visual, WALL_L, rotation + 4, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALL_L, nextRotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_TYPE[rotation], ROTATION_WALL_TYPE[nextRotation], model3, model1, bitset, info);
 
         if (loc->occlude) {
@@ -646,7 +659,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             world3d_set_walldecorationoffset(scene, level, x, z, loc->wallwidth);
         }
     } else if (shape == WALL_SQUARECORNER) {
-        model = loctype_get_model(loc, WALL_SQUARECORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALL_SQUARECORNER, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_wall(scene, level, x, z, y, ROTATION_WALL_CORNER_TYPE[rotation], 0, model, NULL, bitset, info);
 
         if (loc->shadow) {
@@ -669,7 +682,7 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             linklist_add_tail(locs, &locentity_new(locId, level, 0, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALL_DIAGONAL) {
-        model = loctype_get_model(loc, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, shape, rotation, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_add_loc(scene, level, x, z, y, model, NULL, bitset, info, 1, 1, 0);
 
         if (loc->blockwalk && collision) {
@@ -680,8 +693,8 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
             linklist_add_tail(locs, &locentity_new(locId, level, 2, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_STRAIGHT_NOOFFSET) {
-        model = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
-        world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
+        model = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        world3d_set_walldecoration(scene, level, x, z, y, WALL_DECORATION_ROTATION_FORWARD_X[rotation] * r25_straight_decor_inset(locId), WALL_DECORATION_ROTATION_FORWARD_Z[rotation] * r25_straight_decor_inset(locId), bitset, model, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
@@ -692,29 +705,30 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
         if (width > 0) {
             offset = loctype_get(width >> 14 & 0x7fff)->wallwidth;
         }
+        offset += r25_offset_decor_extra(locId);
 
-        model1 = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model1 = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, WALL_DECORATION_ROTATION_FORWARD_X[rotation] * offset, WALL_DECORATION_ROTATION_FORWARD_Z[rotation] * offset, bitset, model1, info, rotation * 512, ROTATION_WALL_TYPE[rotation]);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_OFFSET) {
-        model = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model, info, rotation, 256);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_NOOFFSET) {
-        model = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model, info, rotation, 512);
 
         if (loc->anim != -1) {
             linklist_add_tail(locs, &locentity_new(locId, level, 1, x, z, _SeqType.instances[loc->anim], true)->link);
         }
     } else if (shape == WALLDECOR_DIAGONAL_BOTH) {
-        model = loctype_get_model(loc, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
+        model = loctype_get_model(visual, WALLDECOR_STRAIGHT_NOOFFSET, 0, heightSW, heightSE, heightNE, heightNW, -1);
         world3d_set_walldecoration(scene, level, x, z, y, 0, 0, bitset, model, info, rotation, 768);
 
         if (loc->anim != -1) {
@@ -724,6 +738,8 @@ void world_add_loc2(World *world, int level, int x, int z, World3D *scene, LinkL
 }
 
 void world_build(World *world, World3D *scene, CollisionMap **collision) {
+    uint64_t world_at=ba_timing_now(),terrain_us=0,lighting_us=0,phase_at;
+    r10_reset();
     for (int level = 0; level < 4; level++) {
         for (int x = 0; x < 104; x++) {
             for (int z = 0; z < 104; z++) {
@@ -765,14 +781,14 @@ void world_build(World *world, World3D *scene, CollisionMap **collision) {
         int8_t lightX = -50;
         int8_t lightY = -10;
         int8_t lightZ = -50;
-        int lightMag = (int)SQRT(lightX * lightX + lightY * lightY + lightZ * lightZ);
+        int lightMag = (int)sqrt(lightX * lightX + lightY * lightY + lightZ * lightZ);
         int lightMagnitude = lightAttenuation * lightMag >> 8;
 
         for (int z = 1; z < world->maxTileZ - 1; z++) {
             for (int x = 1; x < world->maxTileX - 1; x++) {
                 int dx = world->levelHeightmap[level][x + 1][z] - world->levelHeightmap[level][x - 1][z];
                 int dz = world->levelHeightmap[level][x][z + 1] - world->levelHeightmap[level][x][z - 1];
-                int len = (int)SQRT(dx * dx + dz * dz + 65536);
+                int len = (int)sqrt(dx * dx + dz * dz + 65536);
                 int normalX = (dx << 8) / len;
                 int normalY = 65536 / len;
                 int normalZ = (dz << 8) / len;
@@ -938,9 +954,11 @@ void world_build(World *world, World3D *scene, CollisionMap **collision) {
         }
     }
 
+    terrain_us=ba_timing_now()-world_at;phase_at=ba_timing_now();
     if (!_World.fullbright) {
         world3d_build_models(scene, 64, 768, -50, -10, -50);
     }
+    lighting_us=ba_timing_now()-phase_at;phase_at=ba_timing_now();
 
     for (int x = 0; x < world->maxTileX; x++) {
         for (int z = 0; z < world->maxTileZ; z++) {
@@ -1113,6 +1131,9 @@ void world_build(World *world, World3D *scene, CollisionMap **collision) {
             }
         }
     }
+    char phase_line[224];
+    snprintf(phase_line,sizeof phase_line,"# world_build_parts %llu terrain %llu lighting %llu occluders_bridges %llu total %llu",(unsigned long long)ba_timing_now(),(unsigned long long)terrain_us,(unsigned long long)lighting_us,(unsigned long long)(ba_timing_now()-phase_at),(unsigned long long)(ba_timing_now()-world_at));
+    ba_cadence_diagnostic(phase_line);
 }
 
 int world_get_drawlevel(World *world, int level, int stx, int stz) {

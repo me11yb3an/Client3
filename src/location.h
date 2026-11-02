@@ -19,4 +19,5 @@ typedef struct {
     int cycle;
     int bitset;
     int8_t info;
+    bool r10_temporary;
 } Location;

@@ -2,9 +2,12 @@
 #include <stdlib.h>
 
 #include "allocator.h"
+#include "animframe.h"
+#include "r104_npc_alpha.h"
 #include "datastruct/lrucache.h"
 #include "jagfile.h"
 #include "model.h"
+#include "r57_body_layers.h"
 #include "npctype.h"
 #include "packet.h"
 #include "platform.h"
@@ -23,9 +26,9 @@ static NpcType *npctype_new(void) {
     npc->walkanim_r = -1;
     npc->walkanim_l = -1;
     npc->animHasAlpha = false;
-    // npc->resizex = -1;
-    // npc->resizey = -1;
-    // npc->resizez = -1;
+    npc->resizex = -1;
+    npc->resizey = -1;
+    npc->resizez = -1;
     npc->minimap = true;
     npc->vislevel = -1;
     npc->resizeh = 128;
@@ -46,10 +49,7 @@ void npctype_unpack(Jagfile *config) {
         offset += g2(idx);
     }
 
-    _NpcType.cache = calloc(20, sizeof(NpcType *));
-    for (int id = 0; id < 20; id++) {
-        _NpcType.cache[id] = npctype_new();
-    }
+    _NpcType.cache = calloc(_NpcType.count, sizeof(NpcType *));
     _NpcType.modelCache = lrucache_new(30);
 
     packet_free(idx);
@@ -58,25 +58,40 @@ void npctype_unpack(Jagfile *config) {
 void npctype_free_global(void) {
     lrucache_free(_NpcType.modelCache);
     free(_NpcType.offsets);
-    for (int i = 0; i < 20; i++) {
-        free(_NpcType.cache[i]);
+    for (int i = 0; i < _NpcType.count; i++) {
+        NpcType *npc = _NpcType.cache[i];
+        if (npc) {
+            free(npc->name);
+            free(npc->desc);
+            free(npc->models);
+            free(npc->heads);
+            free(npc->recol_s);
+            free(npc->recol_d);
+            if (npc->op) {
+                for (int j = 0; j < 5; j++) {
+                    free(npc->op[j]);
+                }
+                free(npc->op);
+            }
+            free(npc);
+        }
     }
     free(_NpcType.cache);
     packet_free(_NpcType.dat);
 }
 
 NpcType *npctype_get(int id) {
-    for (int i = 0; i < 20; i++) {
-        if (_NpcType.cache[i]->index == (int64_t)id) {
-            return _NpcType.cache[i];
-        }
+    if (id < 0 || id >= _NpcType.count) {
+        return NULL;
     }
 
-    _NpcType.cachePos = (_NpcType.cachePos + 1) % 20;
-    NpcType *npc = _NpcType.cache[_NpcType.cachePos] = npctype_new();
-    _NpcType.dat->pos = _NpcType.offsets[id];
-    npc->index = id;
-    npctype_decode(npc, _NpcType.dat);
+    NpcType *npc = _NpcType.cache[id];
+    if (!npc) {
+        npc = _NpcType.cache[id] = npctype_new();
+        _NpcType.dat->pos = _NpcType.offsets[id];
+        npc->index = id;
+        npctype_decode(npc, _NpcType.dat);
+    }
     return npc;
 }
 
@@ -142,22 +157,25 @@ static void npctype_decode(NpcType *npc, Packet *dat) {
             }
         } else if (code == 90) {
             // unused
-            // npc->resizex = g2(dat);
-            g2(dat);
+            npc->resizex = g2(dat);
         } else if (code == 91) {
             // unused
-            // npc->resizey = g2(dat);
-            g2(dat);
+            npc->resizey = g2(dat);
         } else if (code == 92) {
             // unused
-            // npc->resizez = g2(dat);
-            g2(dat);
+            npc->resizez = g2(dat);
         } else if (code == 93) {
             npc->minimap = false;
         } else if (code == 95) {
             npc->vislevel = g2(dat);
         } else if (code == 97) {
             npc->resizeh = g2(dat);
+        } else if (code == 99) {
+            npc->alwaysontop = true;
+        } else if (code == 100) {
+            npc->ambient = (int8_t)g1(dat);
+        } else if (code == 101) {
+            npc->contrast = (int8_t)g1(dat) * 5;
         } else if (code == 98) {
             npc->resizev = g2(dat);
         } else {
@@ -193,10 +211,16 @@ Model *npctype_get_sequencedmodel(NpcType *npc, int primaryTransformId, int seco
         }
 
         model_create_label_references(model, true);
-        model_calculate_normals(model, 64, 850, -30, -50, -30, true, true);
+        model_calculate_normals(model, npc->ambient + 64, npc->contrast + 850, -30, -50, -30, true, true);
+        r57_prepare_body_layers(model);
         lrucache_put(_NpcType.modelCache, npc->index, &model->link);
     }
 
+    /* Imported animations can contain alpha transforms without opcode16.
+     * Promote ownership before copying; entity_draw_free uses the same flag.
+     * Once promoted, every pose starts from the immutable cached alpha. */
+    if (r104_frame_changes_alpha(primaryTransformId) || r104_frame_changes_alpha(secondaryTransformId))
+        npc->animHasAlpha = true;
     tmp = model_share_alpha(model, !npc->animHasAlpha);
 
     if (primaryTransformId != -1 && secondaryTransformId != -1) {
@@ -214,7 +238,7 @@ Model *npctype_get_sequencedmodel(NpcType *npc, int primaryTransformId, int seco
     tmp->label_vertices = NULL;
 
     if (npc->size == 1) {
-        tmp->pick_aabb = true;
+        tmp->pickable = true;
     }
 
     return tmp;

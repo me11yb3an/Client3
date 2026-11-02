@@ -71,13 +71,13 @@ static Jagfile *jagfile_parse(int8_t *src, int length) {
 }
 
 static int jagfile_read(Jagfile *jagfile, const char *name) {
-    uint32_t hash = 0;
+    int hash = 0;
     size_t len = strlen(name);
     for (size_t i = 0; i < len; i++) {
         hash = hash * 61 + toupper(name[i]) - 32;
     }
     for (int id = 0; id < jagfile->file_count; id++) {
-        if ((uint32_t)jagfile->file_hash[id] == hash) {
+        if (jagfile->file_hash[id] == hash) {
             return id;
         }
     }
@@ -94,3 +94,5 @@ static int8_t *jagfile_read_index(Jagfile *jagfile, int id) {
     }
     return dest;
 }
+
+bool jagfile_has_file(Jagfile *jagfile, const char *name) { return jagfile_read(jagfile, name) >= 0; }

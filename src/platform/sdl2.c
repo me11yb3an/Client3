@@ -1,6 +1,5 @@
 #if SDL == 2
 #include "SDL.h"
-#include <SDL_syswm.h>
 
 #include <errno.h>
 #include <stdio.h>
@@ -24,7 +23,7 @@ extern ClientData _Client;
 extern InputTracking _InputTracking;
 extern Custom _Custom;
 
-#if defined(__vita__) || defined(__SWITCH__) || defined(__WIIU__)
+#ifdef __vita__
 static SDL_Joystick *joystick;
 #endif
 static bool right_touch = false;
@@ -73,16 +72,31 @@ void platform_play_wave(int8_t *src, int length) {
     // TODO rm
     // rs2_log("wav %i %i %i\n", wavSpec.freq, wavSpec.samples, wavSpec.format);
     // TODO: custom option for having multiple audio devices play sounds at same time (inauthentic) web already does it
-    if (SDL_GetQueuedAudioSize(device) == 0) {
-        SDL_QueueAudio(device, wavBuffer, wavLength);
+    uint32_t queued_before = SDL_GetQueuedAudioSize(device);
+    int queue_result = -2;
+    if (queued_before == 0) {
+        queue_result = SDL_QueueAudio(device, wavBuffer, wavLength);
         SDL_PauseAudioDevice(device, 0);
     }
+#ifndef __vita__
+    const char *capture = getenv("NATURE_AUDIO_CAPTURE_DIR");
+    if (capture) {
+        static unsigned serial = 0; char path[4096];
+        snprintf(path, sizeof(path), "%s/effect-%04u.wav", capture, ++serial);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(src, 1, 44, f); fwrite(wavBuffer, 1, wavLength, f); fclose(f); }
+        rs2_log("NATURE_AUDIO_PLAYBACK serial=%u ticks=%u device=%u queue_result=%d queued_before=%u bytes=%u volume=%d rate=%d format=%u channels=%u file=%s\n", serial, SDL_GetTicks(), device, queue_result, queued_before, wavLength, g_wavevol, wavSpec.freq, wavSpec.format, wavSpec.channels, path);
+    }
+#endif
     SDL_FreeWAV(wavBuffer);
 }
 
 // TODO separate sdl1? or separate midi
 static void midi_callback(void *data, uint8_t *stream, int len) {
     (void)data;
+#ifndef __vita__
+    uint8_t *nature_original_stream = stream;
+#endif
 // Number of samples to process
 #if SDL == 1
     int SampleBlock, SampleCount = (len / (2 * sizeof(short))); // 2 output channels
@@ -123,13 +137,22 @@ static void midi_callback(void *data, uint8_t *stream, int len) {
         tsf_render_float(g_TinySoundFont, (float *)stream, SampleBlock, 0);
 #endif
     }
+#ifndef __vita__
+    const char *nature_capture = getenv("NATURE_AUDIO_CAPTURE_DIR");
+    if (nature_capture) {
+        static FILE *f = NULL; static size_t written = 0; static bool done = false;
+        const size_t maximum = (size_t)44100 * 2 * sizeof(float) * 120;
+        if (!done && !f) {
+            char path[4096]; snprintf(path,sizeof(path),"%s/midi-output.f32le",nature_capture);f=fopen(path,"wb");
+            if(f)rs2_log("NATURE_MIDI_CALLBACK_CAPTURE ticks=%u rate=44100 format=float32_le channels=2 file=%s\n",SDL_GetTicks(),path);
+            else done=true;
+        }
+        if(f){size_t count=(size_t)len;if(count>maximum-written)count=maximum-written;fwrite(nature_original_stream,1,count,f);fflush(f);written+=count;if(written>=maximum){fclose(f);f=NULL;done=true;rs2_log("NATURE_MIDI_CALLBACK_CAPTURE_DONE bytes=%zu\n",written);}}
+    }
+#endif
 }
 
 bool platform_init(void) {
-    return true;
-}
-
-void platform_new(GameShell *shell) {
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     if (_Custom.resizable) {
         SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1"); // Linear scaling
@@ -146,14 +169,18 @@ void platform_new(GameShell *shell) {
     if (!_Client.lowmem) {
         init |= SDL_INIT_AUDIO;
     }
-#if defined(__vita__) || defined(__SWITCH__) || defined(__WIIU__)
+#ifdef __vita__
     init |= SDL_INIT_JOYSTICK;
 #endif
     if (SDL_Init(init) < 0) {
         rs2_error("SDL_Init failed: %s\n", SDL_GetError());
-        exit(1);
+        return false;
     }
-#if defined(__vita__) || defined(__SWITCH__) || defined(__WIIU__)
+    return true;
+}
+
+void platform_new(GameShell *shell) {
+#ifdef __vita__
     SDL_JoystickEventState(SDL_ENABLE);
     joystick = SDL_JoystickOpen(0);
 #endif
@@ -168,18 +195,6 @@ void platform_new(GameShell *shell) {
         SDL_Quit();
         return;
     }
-
-#ifdef _WIN32
-    SDL_SysWMinfo info;
-    SDL_VERSION(&info.version);
-
-    SDL_GetWindowWMInfo(window, &info);
-    HWND hwnd = info.info.win.window;
-
-    HICON icon = LoadIcon(GetModuleHandle(NULL), "client");
-    SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
-    SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
-#endif
 
 #ifdef ANDROID
     SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
@@ -287,7 +302,7 @@ void platform_new(GameShell *shell) {
 }
 
 void platform_free(void) {
-#if defined(__vita__) || defined(__SWITCH__) || defined(__WIIU__)
+#ifdef __vita__
     SDL_JoystickClose(0);
 #endif
     if (_Custom.resizable) {
@@ -314,6 +329,9 @@ void platform_set_jingle(int8_t *src, int len) {
     tml_free(TinyMidiLoader);
     TinyMidiLoader = tml_load_memory(src, len);
     g_MidiMessage = TinyMidiLoader;
+#ifndef __vita__
+    if(getenv("NATURE_AUDIO_CAPTURE_DIR")){static unsigned serial=0;char path[4096];snprintf(path,sizeof(path),"%s/jingle-%03u.mid",getenv("NATURE_AUDIO_CAPTURE_DIR"),++serial);FILE*f=fopen(path,"wb");if(f){fwrite(src,1,len,f);fclose(f);}int events=0,notes=0;unsigned duration=0;for(tml_message*m=TinyMidiLoader;m;m=m->next){events++;if(m->type==TML_NOTE_ON)notes++;duration=m->time;}rs2_log("NATURE_MIDI_JINGLE ticks=%u loaded=%d events=%d notes=%d duration_ms=%u bytes=%d file=%s\n",SDL_GetTicks(),TinyMidiLoader!=NULL,events,notes,duration,len,path);}
+#endif
     free(src);
 }
 
@@ -360,6 +378,10 @@ void platform_set_midi(const char *name, int crc, int len) {
     tml_free(TinyMidiLoader);
     TinyMidiLoader = tml_load_memory(uncompressed, uncompressed_length);
     g_MidiMessage = TinyMidiLoader;
+#ifndef __vita__
+    if(getenv("NATURE_AUDIO_CAPTURE_DIR")){int events=0,notes=0;unsigned duration=0;for(tml_message*m=TinyMidiLoader;m;m=m->next){events++;if(m->type==TML_NOTE_ON)notes++;duration=m->time;}rs2_log("NATURE_MIDI_SONG ticks=%u name=%s loaded=%d events=%d notes=%d duration_ms=%u status=%d\n",SDL_GetTicks(),name,TinyMidiLoader!=NULL,events,notes,duration,SDL_GetAudioStatus());}
+#endif
+
 
     packet_free(packet);
     free(uncompressed);
@@ -684,81 +706,7 @@ void platform_poll_events(Client *c) {
             key_released(c->shell, code, ch);
             break;
         }
-#if defined(__SWITCH__) || defined(__WIIU__)
-// https://github.com/devkitPro/SDL/blob/wiiu-sdl2-2.32/src/joystick/wiiu/SDL_wiiujoystick.h#L34C1-L44C3
-// https://github.com/devkitPro/SDL/blob/switch-sdl-2.28/src/joystick/switch/SDL_sysjoystick.c#L49
-
-#define JOY_A     0
-#define JOY_B     1
-#define JOY_X     2
-#define JOY_Y     3
-#define JOY_PLUS  10
-#define JOY_MINUS 11
-#define JOY_LEFT  12
-#define JOY_UP    13
-#define JOY_RIGHT 14
-#define JOY_DOWN  15
-
-        case SDL_JOYAXISMOTION: {
-            // rs2_log("axis %d value %d\n", e.jaxis.axis, e.jaxis.value);
-        } break;
-        case SDL_JOYBUTTONDOWN: {
-            switch (e.jbutton.button) {
-            case JOY_A:
-                break;
-            case JOY_B:
-                right_touch = true;
-                break;
-            case JOY_X:
-                key_pressed(c->shell, K_CONTROL, -1);
-                break;
-            case JOY_Y:
-                _Custom.show_performance = !_Custom.show_performance;
-                break;
-            case JOY_DOWN:
-                key_pressed(c->shell, K_DOWN, -1);
-                break;
-            case JOY_LEFT:
-                key_pressed(c->shell, K_LEFT, -1);
-                break;
-            case JOY_UP:
-                key_pressed(c->shell, K_UP, -1);
-                break;
-            case JOY_RIGHT:
-                key_pressed(c->shell, K_RIGHT, -1);
-                break;
-            }
-            break;
-        } break;
-        case SDL_JOYBUTTONUP: {
-            switch (e.jbutton.button) {
-            case JOY_A:
-                break;
-            case JOY_B:
-                right_touch = false;
-                break;
-            case JOY_X:
-                key_released(c->shell, K_CONTROL, -1);
-                break;
-            case JOY_Y:
-                break;
-            case JOY_DOWN:
-                key_released(c->shell, K_DOWN, -1);
-                break;
-            case JOY_LEFT:
-                key_released(c->shell, K_LEFT, -1);
-                break;
-            case JOY_UP:
-                key_released(c->shell, K_UP, -1);
-                break;
-            case JOY_RIGHT:
-                key_released(c->shell, K_RIGHT, -1);
-                break;
-            }
-            break;
-        } break;
-#endif
-#if defined(__vita__)
+#ifdef __vita__
         case SDL_JOYAXISMOTION: {
             // rs2_log("axis %d value %d\n", e.jaxis.axis, e.jaxis.value);
         } break;
@@ -773,7 +721,6 @@ void platform_poll_events(Client *c) {
                 right_touch = true;
                 break;
             case 3: // Square
-                _Custom.show_performance = !_Custom.show_performance;
                 break;
             case 4: // L1
                 break;
@@ -879,7 +826,6 @@ void platform_poll_events(Client *c) {
             last_touch_y = y;
 
             if (insideMobileInputArea(c)) {
-                // TODO: this doesn't allow removing pre-existing text on wiiu/switch, nothing happens on vita?
                 SDL_StartTextInput();
             }
 

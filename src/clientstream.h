@@ -17,6 +17,7 @@ bool clientstream_init(void);
 ClientStream *clientstream_new(void);
 ClientStream *clientstream_opensocket(int port);
 void clientstream_close(ClientStream *stream);
+void clientstream_destroy(ClientStream *stream);
 int clientstream_available(ClientStream *stream, int length);
 int clientstream_read_byte(ClientStream *stream);
 int clientstream_read_bytes(ClientStream *stream, int8_t *dst, int off, int len);

@@ -17,3 +17,4 @@ DoublyLinkable *lrucache_get(LruCache *cache, int64_t key);
 void lrucache_put(LruCache *cache, int64_t key, DoublyLinkable *value);
 void lrucache_clear(LruCache *cache);
 void lrucache_free(LruCache *cache);
+void lrucache_free_entries(LruCache *cache, void (*destroy)(DoublyLinkable *));

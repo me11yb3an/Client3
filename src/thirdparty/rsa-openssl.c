@@ -23,6 +23,15 @@ int rsa_init(struct rsa *rsa, const char *exponent, const char *modulus) {
     return 0;
 }
 
+void rsa_free(struct rsa *rsa) {
+    BN_CTX_free(rsa->ctx);
+    BN_free(rsa->exponent);
+    BN_free(rsa->modulus);
+    rsa->ctx = NULL;
+    rsa->exponent = NULL;
+    rsa->modulus = NULL;
+}
+
 int rsa_crypt(struct rsa *rsa, void *buffer, size_t len,
               void *out, size_t outlen) {
     BIGNUM *encrypted;

@@ -22,9 +22,12 @@ typedef struct {
     int *recol_s;
     int *recol_d;
     char **op;
-    // int resizex;  // = -1;
-    // int resizey;  // = -1;
-    // int resizez;  // = -1;
+    int resizex;  // = -1;
+    int resizey;  // = -1;
+    int resizez;  // = -1;
+    bool alwaysontop; // recovered opcode99; default false preserves existing NPCs
+    int ambient; // recovered opcode100; default zero
+    int contrast; // recovered opcode101, scaled by five; default zero
     bool minimap; // = true;
     int vislevel; // = -1;
     int resizeh;  // = 128;

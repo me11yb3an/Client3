@@ -11,11 +11,12 @@
 
 ComponentData _Component = {0};
 
-// save memory by not needlessly allocating maximum string size for all components
-void realloc_and_copy(char** to, char* from) {
-    size_t text_len = strlen(from) + 1;
-    *to = realloc(*to, text_len);
-    strcpy(*to, from);
+static void component_free_cached_image(DoublyLinkable *node) {
+    pix24_free((Pix24 *)node);
+}
+
+static void component_free_cached_model(DoublyLinkable *node) {
+    model_free((Model *)node);
 }
 
 void component_free_global(void) {
@@ -39,12 +40,6 @@ void component_free_global(void) {
             if (_Component.instances[i]->actionVerb) {
                 free(_Component.instances[i]->actionVerb);
                 free(_Component.instances[i]->action);
-            }
-            if (_Component.instances[i]->text) {
-                free(_Component.instances[i]->text);
-            }
-            if (_Component.instances[i]->option) {
-                free(_Component.instances[i]->option);
             }
             if (_Component.instances[i]->activeText) {
                 free(_Component.instances[i]->activeText);
@@ -78,6 +73,20 @@ void component_free_global(void) {
         free(_Component.instances[i]);
     }
     free(_Component.instances);
+    _Component.instances = NULL;
+    _Component.count = 0;
+
+    // Components retain pointers to cache entries (graphics, inventory
+    // sprites, and models). Keep the cache alive for the full client session
+    // and release it only after those users have stopped drawing.
+    if (_Component.imageCache) {
+        lrucache_free_entries(_Component.imageCache, component_free_cached_image);
+        _Component.imageCache = NULL;
+    }
+    if (_Component.modelCache) {
+        lrucache_free_entries(_Component.modelCache, component_free_cached_model);
+        _Component.modelCache = NULL;
+    }
 }
 
 void component_unpack(Jagfile *jag, Jagfile *media, PixFont **fonts) {
@@ -154,10 +163,8 @@ void component_unpack(Jagfile *jag, Jagfile *media, PixFont **fonts) {
         }
 
         if (com->type == TYPE_UNUSED) {
-            g2(dat);
-            g1(dat);
-            // com->unusedShort1 = g2(dat);
-            // com->unusedBoolean1 = g1(dat) == 1;
+            com->unusedShort1 = g2(dat);
+            com->unusedBoolean1 = g1(dat) == 1;
         }
 
         if (com->type == TYPE_INV) {
@@ -218,7 +225,9 @@ void component_unpack(Jagfile *jag, Jagfile *media, PixFont **fonts) {
         }
 
         if (com->type == TYPE_TEXT) {
-            com->text = gjstr(dat);
+            char *text = gjstr(dat);
+            strcpy(com->text, text);
+            free(text);
             com->activeText = gjstr(dat);
         }
 
@@ -320,25 +329,25 @@ void component_unpack(Jagfile *jag, Jagfile *media, PixFont **fonts) {
         }
 
         if (com->buttonType == BUTTON_OK || com->buttonType == BUTTON_TOGGLE || com->buttonType == BUTTON_SELECT || com->buttonType == BUTTON_CONTINUE) {
-            com->option = gjstr(dat);
+            char *option = gjstr(dat);
+            strcpy(com->option, option);
 
             if (strlen(com->option) == 0) {
                 if (com->buttonType == BUTTON_OK) {
-                    realloc_and_copy(&com->option, "Ok");
+                    strcpy(com->option, "Ok");
                 } else if (com->buttonType == BUTTON_TOGGLE) {
-                    realloc_and_copy(&com->option, "Select");
+                    strcpy(com->option, "Select");
                 } else if (com->buttonType == BUTTON_SELECT) {
-                    realloc_and_copy(&com->option, "Select");
+                    strcpy(com->option, "Select");
                 } else if (com->buttonType == BUTTON_CONTINUE) {
-                    realloc_and_copy(&com->option, "Continue");
+                    strcpy(com->option, "Continue");
                 }
             }
+            free(option);
         }
     }
 
     packet_free(dat);
-    lrucache_free(_Component.imageCache);
-    lrucache_free(_Component.modelCache);
 }
 
 Pix24 *component_get_image(Jagfile *media, char *sprite, int spriteId) {
@@ -350,6 +359,9 @@ Pix24 *component_get_image(Jagfile *media, char *sprite, int spriteId) {
 
     // try {
     image = pix24_from_archive(media, sprite, spriteId);
+    if (!image) {
+        return NULL;
+    }
     lrucache_put(_Component.imageCache, uid, &image->link);
     // } catch (Exception ignored) {
     // 	return null;
@@ -365,6 +377,9 @@ Model *component_get_model(int id) {
     }
 
     m = model_from_id(id, false);
+    if (!m) {
+        return NULL;
+    }
     lrucache_put(_Component.modelCache, id, &m->link);
     return m;
 }
