@@ -6,8 +6,12 @@
 #include "allocator.h"
 #include "client.h"
 #include "custom.h"
+#include "vita_enhanced.h"
+#include "layoutcore.h"
+#include "vita_wide_layout.h"
 #include "datastruct/jstring.h"
 #include "gameshell.h"
+#include "platform.h"
 #include "inputtracking.h"
 #include "thirdparty/ini.h"
 
@@ -55,8 +59,6 @@ Custom _Custom = {.chat_era = 2, .http_port = 80};
 bool load_ini_args(void) {
 #ifdef NXDK
     ini_t *config = ini_load("D:\\config.ini");
-#elif defined(__SWITCH__) || defined(__WIIU__) || defined(__3DS__)
-    ini_t *config = ini_load("rom/config.ini");
 #else
     ini_t *config = ini_load("config.ini");
 #endif
@@ -70,11 +72,10 @@ bool load_ini_args(void) {
     // world nodeid 1 = 10 (default)
     INI_INT_LOG(&(&_Client), nodeid, _Client.nodeid = 10 + _Client.nodeid - 1);
     INI_INT_LOG(&(&_Client), portoff, );
-#if defined(__PSP__) || defined(_arch_dreamcast) || defined(__NDS__) || defined(NXDK)
-    _Client.lowmem = true;
-    rs2_log("  lowmem: %d (option overwritten due to limited memory)", _Client.lowmem);
-#else
     INI_INT_LOG(&(&_Client), lowmem, );
+#if defined(__PSP__) || defined(_arch_dreamcast) || defined(__NDS__) || defined(NXDK)
+    // implicitly ignore highmem, avoids confusion as there's no way it'll load, except if xbox has mem expansion
+    _Client.lowmem = true;
 #endif
     INI_INT_LOG(&(&_Client), members, _Client.members = !_Client.members);
 
@@ -86,8 +87,6 @@ bool load_ini_args(void) {
 void load_ini_config(Client *c) {
 #ifdef NXDK
     ini_t *config = ini_load("D:\\config.ini");
-#elif defined(__SWITCH__) || defined(__WIIU__)
-    ini_t *config = ini_load("rom/config.ini");
 #else
     ini_t *config = ini_load("config.ini");
 #endif
@@ -218,8 +217,8 @@ void load_ini_config(Client *c) {
     int deltaZ = sceneZ - c->cameraZ;
     int distance = (int)sqrt(deltaX * deltaX + deltaZ * deltaZ);
 
-    c->cameraPitch = (int)(atan2(deltaY, distance) * RADIANS_TO_RS) & 0x7ff;
-    c->cameraYaw = (int)(atan2(deltaX, deltaZ) * -RADIANS_TO_RS) & 0x7ff;
+    c->cameraPitch = (int)(atan2(deltaY, distance) * 325.949) & 0x7ff;
+    c->cameraYaw = (int)(atan2(deltaX, deltaZ) * -325.949) & 0x7ff;
     if (c->cameraPitch < 128) {
         c->cameraPitch = 128;
     }
@@ -229,9 +228,23 @@ void load_ini_config(Client *c) {
     }
 } */
 
-void draw_info_overlay(Client *c) {
-    int x = 507;
-    int y = 13;
+const char *classic_perf_display(int slot,const char *text){
+#if defined(__vita__) && defined(GL11)
+    static char displayed[6][128];
+    static uint64_t updated[6];
+    static unsigned valid;
+    if(ve_enabled()||slot<0||slot>=6||strlen(text)>=sizeof displayed[0])return text;
+    uint64_t now=rs2_now();
+    if(!(valid&(1u<<slot))||now-updated[slot]>=250){
+        strcpy(displayed[slot],text);updated[slot]=now;valid|=1u<<slot;
+    }
+    return displayed[slot];
+#else
+    (void)slot;return text;
+#endif
+}
+
+static void draw_info_overlay_inner(Client *c,int x,int y,int local) {
 
     char buf[MAX_STR];
     if (_Custom.show_performance) {
@@ -241,21 +254,30 @@ void draw_info_overlay(Client *c) {
         y += 13;
         y += 13;
         sprintf(buf, "LRU: %dK / %dK", bump_allocator_used() >> 10, bump_allocator_capacity() >> 10);
-        drawStringRight(c->font_plain11, x, y, buf, YELLOW, true);
+        drawStringRight(c->font_plain11, (local?x:PERF_RIGHT(x)), (local?y:PERF_BASELINE(y)), (local?buf:classic_perf_display(4,buf)), YELLOW, true);
         y += 13;
         sprintf(buf, "FPS: %d", c->shell->fps);
-        drawStringRight(c->font_plain11, x, y, buf, YELLOW, true);
+        drawStringRight(c->font_plain11, (local?x:PERF_RIGHT(x)), (local?y:PERF_BASELINE(y)), (local?buf:classic_perf_display(5,buf)), YELLOW, true);
         y += 13;
 #if defined(__vita__)
 #include <psp2/power.h>
-        sprintf(buf, "BAT: %d%%", scePowerGetBatteryLifePercent());
-        drawStringRight(c->font_plain11, x, y, buf, YELLOW, true);
+        /* System-service queries are slow IPC. Sample at display cadence,
+         * not once per rendered frame. FPS and allocator counts remain live. */
+        static uint64_t power_at;
+        static int power_ready, battery, arm_mhz, gpu_mhz;
+        uint64_t power_now=rs2_now();
+        if(!power_ready||power_now-power_at>=1000){
+            battery=scePowerGetBatteryLifePercent();arm_mhz=scePowerGetArmClockFrequency();gpu_mhz=scePowerGetGpuClockFrequency();
+            power_at=power_now;power_ready=1;
+        }
+        sprintf(buf, "BAT: %d%%", battery);
+        drawStringRight(c->font_plain11, (local?x:PERF_RIGHT(x)), (local?y:PERF_BASELINE(y)), buf, YELLOW, true);
         y += 13;
-        sprintf(buf, "CPU: %d MHz", scePowerGetArmClockFrequency());
-        drawStringRight(c->font_plain11, x, y, buf, YELLOW, true);
+        sprintf(buf, "CPU: %d MHz", arm_mhz);
+        drawStringRight(c->font_plain11, (local?x:PERF_RIGHT(x)), (local?y:PERF_BASELINE(y)), buf, YELLOW, true);
         y += 13;
-        sprintf(buf, "GPU: %d MHz", scePowerGetGpuClockFrequency());
-        drawStringRight(c->font_plain11, x, y, buf, YELLOW, true);
+        sprintf(buf, "GPU: %d MHz", gpu_mhz);
+        drawStringRight(c->font_plain11, (local?x:PERF_RIGHT(x)), (local?y:PERF_BASELINE(y)), buf, YELLOW, true);
         y += 13;
 #endif
     }
@@ -301,29 +323,28 @@ void draw_info_overlay(Client *c) {
     }
 }
 
+void draw_info_overlay(Client*c){draw_info_overlay_inner(c,507,13,0);}
+void draw_info_overlay_local(Client*c,int x,int y){draw_info_overlay_inner(c,x,y,1);}
+
 bool insideChatInputArea(Client *c) {
-    // 495 x 33
-    const int chatInputAreaX1 = 11;
-    const int chatInputAreaY1 = 449;
-    const int chatInputAreaX2 = chatInputAreaX1 + 495;
-    const int chatInputAreaY2 = chatInputAreaY1 + 33;
-    return c->ingame &&
-           c->chat_interface_id == -1 &&
-           !c->chatback_input_open &&
-           !c->show_social_input &&
-           c->shell->mouse_x >= chatInputAreaX1 &&
-           c->shell->mouse_x <= chatInputAreaX2 &&
-           c->shell->mouse_y >= chatInputAreaY1 &&
-           c->shell->mouse_y <= chatInputAreaY2;
+    if (!c->ingame || c->chat_interface_id>=0 || c->sticky_chat_interface_id>=0 ||
+        c->viewport_interface_id>=0 || c->chatback_input_open || c->show_social_input ||
+        c->modal_message[0] || (ve_enabled() && ve_chat_hidden(c))) return false;
+    int x=ve_enabled()?ve_chat_text_x():lc_x(LC_CHAT,22);
+    int y=ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375));
+    // Match the rendered separator and typing baseline (Enhanced 80/93, Classic 77/90).
+    int top=y+(ve_enabled()?81:78);
+    return c->shell->mouse_x>=x && c->shell->mouse_x<x+lc_chat_text_right(CHAT_TEXT_RIGHT) &&
+           c->shell->mouse_y>=top && c->shell->mouse_y<y+96;
 }
 
 bool insideChatPopupArea(Client *c) {
-    // 495 x 99
-    const int chatInputAreaX1 = 11;
-    const int chatInputAreaY1 = 383;
-    const int chatInputAreaX2 = chatInputAreaX1 + 495;
-    const int chatInputAreaY2 = chatInputAreaY1 + 99;
-    return c->ingame && (c->chatback_input_open || c->show_social_input) && c->shell->mouse_x >= chatInputAreaX1 && c->shell->mouse_x <= chatInputAreaX2 && c->shell->mouse_y >= chatInputAreaY1 && c->shell->mouse_y <= chatInputAreaY2;
+    if (!c->ingame || !(c->chatback_input_open || c->show_social_input) ||
+        (ve_enabled() && ve_chat_hidden(c))) return false;
+    int x=ve_enabled()?ve_chat_text_x():lc_x(LC_CHAT,22);
+    int y=ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375));
+    return c->shell->mouse_x>=x && c->shell->mouse_x<x+lc_chat_text_right(CHAT_TEXT_RIGHT) &&
+           c->shell->mouse_y>=y && c->shell->mouse_y<y+96;
 }
 
 bool insideReportInterfaceTextArea(Client *c) {

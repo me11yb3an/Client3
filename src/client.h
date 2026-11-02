@@ -170,6 +170,12 @@ struct Client {
     int hint_type;
     int menu_size;
     bool menu_visible;
+#ifdef __vita__
+    int vita_menu_selected;
+    bool vita_menu_active;
+    bool vita_menu_confirm;
+    bool vita_menu_cancel;
+#endif
 
     int obj_selected;
     int spell_selected;
@@ -193,6 +199,19 @@ struct Client {
 
     int friend_count;
     int sticky_chat_interface_id;
+    int vita_dialogue_root, vita_dialogue_selected;
+    unsigned int vita_dialogue_signature, vita_dialogue_generation, vita_dialogue_seen_generation;
+    bool vita_dialogue_controller, vita_interface_blocked, vita_interface_enabled;
+    int vita_dialogue_mouse_x, vita_dialogue_mouse_y;
+    bool title_restored;
+    PixMap *title_panel_scaled;
+    Pix24 *title_panel_background;
+    Pix24 *title_restored_background;
+    PixMap *title_flame_left, *title_flame_right, *title_flame_clip_left, *title_flame_clip_right;
+    int vita_skill_selected, vita_skill_mouse_x, vita_skill_mouse_y;
+    unsigned int vita_skill_signature, vita_skill_generation, vita_skill_seen_generation;
+    bool vita_skill_controller;
+    bool vita_skill_waiting;
     int chat_interface_id;
     int viewport_interface_id;
     int sidebar_interface_id;

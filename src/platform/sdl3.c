@@ -131,65 +131,60 @@ static void midi_callback(void *data, SDL_AudioStream *stream, int additional_am
 }
 
 bool platform_init(void) {
-    return true;
-}
-
-void platform_new(GameShell *shell) {
     int init = SDL_INIT_VIDEO;
     if (!_Client.lowmem) {
         init |= SDL_INIT_AUDIO;
     }
     if (!SDL_Init(init)) {
         rs2_error("SDL3: SDL_Init failed: %s\n", SDL_GetError());
-        exit(1);
+        return false;
     }
+    return true;
+}
+
+void platform_new(GameShell *shell) {
     int win_flags = 0;
     if (_Custom.resizable) {
         win_flags |= SDL_WINDOW_RESIZABLE;
     }
-    // TODO set titlebar icon in here (see sdl1/sdl2)
-    if (!_Custom.resizable) {
-        window = SDL_CreateWindow("Jagex", SCREEN_FB_WIDTH, SCREEN_FB_HEIGHT, win_flags);
-        if (!window) {
-            rs2_error("SDL3: window creation failed: %s\n", SDL_GetError());
-            SDL_Quit();
-            exit(1);
-        }
+    window = SDL_CreateWindow("Jagex", SCREEN_FB_WIDTH, SCREEN_FB_HEIGHT, win_flags);
+    if (!window) {
+        rs2_error("SDL3: window creation failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return;
+    }
 
+    if (!_Custom.resizable) {
         window_surface = SDL_GetWindowSurface(window);
         if (!window_surface) {
             rs2_error("SDL3: window surface creation failed: %s\n", SDL_GetError());
             SDL_DestroyWindow(window);
             SDL_Quit();
-            exit(1);
+            return;
         }
     } else {
-        int num_renderers = SDL_GetNumRenderDrivers();
-        if (num_renderers == 0) {
-            rs2_error("SDL3: no renderers available!\n");
-            SDL_DestroyWindow(window);
-            SDL_Quit();
-            exit(1);
-        }
-
-        if (!SDL_CreateWindowAndRenderer("Jagex", SCREEN_FB_WIDTH, SCREEN_FB_HEIGHT, win_flags, &window, &renderer)) {
-            if (!window) {
-                rs2_error("SDL3: window creation failed: %s\n", SDL_GetError());
-            }
-            if (!renderer) {
-                rs2_error("SDL3: renderer creation failed: %s\n", SDL_GetError());
-                SDL_DestroyWindow(window);
-            }
-            SDL_Quit();
-            exit(1);
-        }
-
         window_surface = SDL_CreateSurface(shell->screen_width, shell->screen_height, SDL_GetPixelFormatForMasks(32, 0xff0000, 0x00ff00, 0x0000ff, 0));
         if (!window_surface) {
             rs2_error("SDL2: surface creation failed: %s\n", SDL_GetError());
             SDL_DestroyWindow(window);
             SDL_Quit();
-            exit(1);
+            return;
+        }
+
+        int num_renderers = SDL_GetNumRenderDrivers();
+        if (num_renderers == 0) {
+            rs2_error("SDL3: no renderers available!\n");
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return;
+        }
+
+        renderer = SDL_CreateRenderer(window, NULL);
+        if (!renderer) {
+            rs2_error("SDL3: renderer creation failed: %s\n", SDL_GetError());
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return;
         }
 
         char renderers[1024] = {0};
@@ -211,7 +206,7 @@ void platform_new(GameShell *shell) {
             rs2_error("SDL3: texture creation failed: %s\n", SDL_GetError());
             SDL_DestroyWindow(window);
             SDL_Quit();
-            exit(1);
+            return;
         }
 
         SDL_SetRenderLogicalPresentation(renderer, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_LOGICAL_PRESENTATION_LETTERBOX);
@@ -220,22 +215,6 @@ void platform_new(GameShell *shell) {
     if (_Client.lowmem) {
         return;
     }
-
-    char drivers[1024] = {0};
-    const char *r_name = SDL_GetCurrentAudioDriver();
-    int count = SDL_GetNumAudioDrivers();
-    for (int i = 0; i < count; i++) {
-        const char *name = SDL_GetAudioDriver(i);
-        if (i > 0) {
-            strcat(drivers, ", ");
-        }
-        strcat(drivers, name);
-        if (!strcmp(name, r_name)) {
-            strcat(drivers, "*");
-        }
-    }
-    rs2_log("SDL audio drivers: [%s]\n", drivers);
-
     // Create MIDI audio stream:
     const SDL_AudioSpec midi_spec = {.format = SDL_AUDIO_F32, .channels = 2, .freq = 44100};
 

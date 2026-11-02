@@ -50,6 +50,12 @@ rsa_init(struct rsa *rsa, const char *exponent, const char *modulus)
 	return 0;
 }
 
+void
+rsa_free(struct rsa *rsa)
+{
+	(void)rsa;
+}
+
 int
 rsa_crypt(struct rsa *rsa, void *buffer, size_t len,
 	    void *out, size_t outlen)

@@ -1,3 +1,8 @@
+#include "ba_timing.h"
+#include <stdio.h>
+#ifdef BUILD_A_EMBEDDED
+#include "embedded_server.h"
+#endif
 #include <stdlib.h>
 
 #include "client.h"
@@ -10,12 +15,6 @@
 #ifdef __3DS__
 #include <3ds.h>
 #endif
-#ifdef __NDS__
-#include <nds.h>
-#endif
-#ifdef __SWITCH__
-#include <switch.h>
-#endif
 
 extern InputTracking _InputTracking;
 
@@ -26,6 +25,10 @@ int last_touch_button = 0;
 
 static void gameshell_update_touch(Client *c) {
     if (update_touch) {
+#ifdef BUILD_A_EMBEDDED
+        FILE *trace=fopen("ux0:/data/RS2Vita/input-events.csv","a");
+        if(trace){fprintf(trace,"%llu,TOUCH,%d,%d,%d\n",(unsigned long long)ba_timing_now(),last_touch_x,last_touch_y,last_touch_button);fclose(trace);}
+#endif
         c->shell->mouse_click_x = last_touch_x;
         c->shell->mouse_click_y = last_touch_y;
         c->shell->mouse_click_button = last_touch_button;
@@ -68,10 +71,28 @@ void gameshell_init_application(Client *c, int width, int height) {
     gameshell_run(c);
 }
 
-void gameshell_run(Client *c) {
-    gameshell_draw_progress(c->shell, "Loading...", 0);
-    client_load(c);
+#ifdef BUILD_A_EMBEDDED
+#include <stdio.h>
+#include "ba_pacing.inc" /* per-second draw-time histogram is recorded here */
+#endif
 
+void gameshell_run(Client *c) {
+    if(h5_mode()=='S'){
+        h5_mark("server_only_begin");
+        if(ba_server_start("app0:/serverdata","ux0:/data/RS2Vita/players","app0:/sp/sp-bootstrap.js","app0:/sp/server.bundle.npc-unload.js"))return;
+        while(!h5_step(ba_server_ready()==1,0,0)){uint64_t start=ba_timing_now();ba_server_pump();ba_timing_record(BA_SERVER_PUMP,ba_timing_now()-start);rs2_sleep(1);}
+        for(;;)rs2_sleep(100);
+    }
+    gameshell_draw_progress(c->shell, "Loading...", 0);
+    h5_mark("client_assets_begin");client_load(c);h5_mark("client_assets_ready");
+#ifdef BUILD_A_EMBEDDED
+    if(ba_run_paced(c))return;
+#endif
+
+#ifdef BUILD_A_EMBEDDED
+    extern void ba_vita_sample(unsigned,unsigned);
+    unsigned measured_frames=0,measured_ticks=0;
+#endif
     int opos = 0;
     int ratio = 256;
     int delta = 1;
@@ -86,17 +107,6 @@ void gameshell_run(Client *c) {
             return;
         }
 #endif
-#ifdef __NDS__
-        if (!pmMainLoop()) {
-            return;
-        }
-#endif
-#ifdef __SWITCH__
-        if (!appletMainLoop()) {
-            return;
-        }
-#endif
-
         if (c->shell->state > 0) {
             c->shell->state--;
             if (c->shell->state == 0) {
@@ -136,9 +146,20 @@ void gameshell_run(Client *c) {
         }
 
         rs2_sleep(delta);
+#if defined(__vita__) && (!defined(SDL) || SDL == 0)
+        // Sample once per rendered frame; held keys still run each logic tick.
+        platform_poll_events(c);
+#endif
         while (count < 256) {
+#if !defined(__vita__) || (defined(SDL) && SDL != 0)
             platform_poll_events(c);
+#endif
+            uint64_t logic_started=ba_timing_now();
             client_update(c);
+            ba_timing_record(BA_LOGIC,ba_timing_now()-logic_started);
+#ifdef BUILD_A_EMBEDDED
+            measured_ticks++;
+#endif
             c->shell->mouse_click_button = 0;
             c->shell->key_queue_read_pos = c->shell->key_queue_write_pos;
             count += ratio;
@@ -147,9 +168,22 @@ void gameshell_run(Client *c) {
         if (c->shell->deltime > 0) {
             c->shell->fps = ratio * 1000 / (c->shell->deltime * 256);
         }
+#ifdef BUILD_A_EMBEDDED
+        uint64_t pump_started=ba_timing_now();
+        if(ba_server_ready()>=0) ba_server_pump();
+        ba_timing_record(BA_SERVER_PUMP,ba_timing_now()-pump_started);
+#endif
+        uint64_t render_started=ba_timing_now();
         client_draw(c);
+        ba_timing_record(BA_RENDER,ba_timing_now()-render_started);
         gameshell_update_touch(c); // update mouse after client_draw_scene to fix model picking (not needed for touch on release like client-ts)
+        uint64_t present_started=ba_timing_now();
         platform_update_surface();
+        ba_timing_record(BA_PRESENT,ba_timing_now()-present_started);
+        ba_timing_flush();
+#ifdef BUILD_A_EMBEDDED
+        ba_vita_sample(++measured_frames,measured_ticks);
+#endif
     }
     if (c->shell->state == -1) {
         gameshell_shutdown(c);
@@ -164,6 +198,10 @@ void gameshell_destroy(Client *c) {
 
 void gameshell_shutdown(Client *c) {
     c->shell->state = -2;
+#ifdef BUILD_A_EMBEDDED
+    ba_server_stop();
+    h7_live_finish();
+#endif
     client_unload(c);
     // rs2_sleep(1000); // NOTE: original
     exit(0);
@@ -318,6 +356,7 @@ int poll_key(GameShell *shell) {
 }
 
 void gameshell_draw_progress(GameShell *shell, const char *message, int progress) {
+    h5_mark(message);if(h5_silent())return;
     // NOTE there's no update or paint to call refresh, only focus gained event
     if (shell->refresh) {
         platform_set_color(BLACK);

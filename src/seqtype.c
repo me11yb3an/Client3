@@ -18,6 +18,9 @@ static SeqType *seqtype_new(void) {
     seq->righthand = -1;
     seq->lefthand = -1;
     seq->replaycount = 99;
+    seq->precedenceAnimating = -1;
+    seq->priorityWalking = -1;
+    seq->replayMode = 2;
     return seq;
 }
 
@@ -104,6 +107,15 @@ static void seqtype_decode(SeqType *seq, Packet *dat) {
             seq->lefthand = g2(dat);
         } else if (code == 8) {
             seq->replaycount = g1(dat);
+        } else if (code == 9) {
+            seq->precedenceAnimating = g1(dat);
+            seq->compatibilityMetadata = true;
+        } else if (code == 10) {
+            seq->priorityWalking = g1(dat);
+            seq->compatibilityMetadata = true;
+        } else if (code == 11) {
+            seq->replayMode = g1(dat);
+            seq->compatibilityMetadata = true;
         } else {
             rs2_error("Error unrecognised seq config code: %d\n", code);
         }

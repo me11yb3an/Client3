@@ -339,13 +339,17 @@ void rsaenc(Packet *packet, const char *mod, const char *exp) {
     struct rsa rsa = {0};
     if (rsa_init(&rsa, exp, mod) < 0) {
         rs2_error("rsa_init failed\n");
+        rsa_free(&rsa);
+        free(temp);
         exit(1);
     }
 
     int8_t enc[128] = {0};
     int enc_len = rsa_crypt(&rsa, temp, length, enc, sizeof(enc));
+    rsa_free(&rsa);
     if (enc_len < 0) {
         rs2_error("failed to rsa_crypt\n");
+        free(temp);
         return;
     }
     free(temp);
@@ -370,13 +374,17 @@ void rsadec(Packet *packet, const char *mod, const char *exp) {
     struct rsa rsa = {0};
     if (rsa_init(&rsa, exp, mod) < 0) {
         rs2_error("rsa_init failed\n");
+        rsa_free(&rsa);
+        free(enc);
         exit(1);
     }
 
     int8_t dec[128] = {0};
     int dec_len = rsa_crypt(&rsa, enc, length, dec, sizeof(enc));
+    rsa_free(&rsa);
     if (dec_len < 0) {
         rs2_error("failed to rsa_crypt\n");
+        free(enc);
         return;
     }
     free(enc);

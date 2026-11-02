@@ -1,0 +1,48 @@
+#pragma once
+typedef struct {int kind,color,depth;}R51Type;
+static R51Type r51_type(int id){switch(id){
+case 10:return (R51Type){4,64,16};
+case 98:return (R51Type){3,0,0};
+case 133:return (R51Type){1,0,0};
+case 878:return (R51Type){2,43906,32};
+case 884:return (R51Type){2,43906,0};
+case 1724:return (R51Type){3,0,0};
+case 1727:return (R51Type){3,0,0};
+case 1728:return (R51Type){3,0,0};
+case 1732:return (R51Type){3,0,0};
+case 1733:return (R51Type){3,0,0};
+case 1736:return (R51Type){3,0,0};
+case 1741:return (R51Type){3,0,0};
+case 1745:return (R51Type){3,0,0};
+case 1746:return (R51Type){4,64,16};
+case 1749:return (R51Type){4,64,16};
+case 1754:return (R51Type){1,0,0};
+case 1756:return (R51Type){1,0,0};
+case 1758:return (R51Type){1,0,0};
+case 1759:return (R51Type){1,0,0};
+case 1765:return (R51Type){1,0,0};
+case 1767:return (R51Type){1,0,0};
+case 2113:return (R51Type){1,0,0};
+case 2147:return (R51Type){1,0,0};
+case 2187:return (R51Type){1,0,0};
+case 2190:return (R51Type){1,0,0};
+case 2269:return (R51Type){4,64,16};
+case 2408:return (R51Type){1,0,0};
+case 2512:return (R51Type){4,64,16};
+case 2522:return (R51Type){3,0,0};
+case 2590:return (R51Type){4,64,16};
+case 2591:return (R51Type){4,64,16};
+case 2605:return (R51Type){1,0,0};
+case 2611:return (R51Type){4,64,16};
+case 2616:return (R51Type){3,0,0};
+case 2797:return (R51Type){1,0,0};
+case 2812:return (R51Type){1,0,0};
+case 2871:return (R51Type){1,0,0};
+case 3029:return (R51Type){1,0,0};
+case 3031:return (R51Type){1,0,0};
+case 3264:return (R51Type){2,3470,-44};
+case 3305:return (R51Type){2,3470,-44};
+case 3359:return (R51Type){2,3470,-44};
+case 3483:return (R51Type){4,64,16};
+case 3528:return (R51Type){2,6020,-12};
+default:return (R51Type){0,0,0};}}

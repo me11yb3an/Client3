@@ -7,10 +7,21 @@
 #include "pix2d.h"
 #include "pix8.h"
 
+// Fail closed if the texture/sprite allocation cannot be satisfied. No output change on success.
+static void *pix8_checked_alloc(size_t count, size_t size, bool clear) {
+    void *memory = clear ? calloc(count, size) : malloc(count * size);
+    if (!memory && count && size) {
+        fprintf(stderr, "pix8.c: allocation failed\n");
+        abort();
+    }
+    return memory;
+}
+
+
 extern Pix2D _Pix2D;
 
 Pix8 *pix8_new(int width, int height, int *palette, int palette_count) {
-    Pix8 *pix8 = calloc(1, sizeof(Pix8));
+    Pix8 *pix8 = pix8_checked_alloc(1, sizeof(Pix8), true);
     pix8->width = pix8->crop_w = width;
     pix8->height = pix8->crop_h = height;
     pix8->crop_x = pix8->crop_y = 0;
@@ -27,7 +38,7 @@ void pix8_free(Pix8 *pix8) {
 
 Pix8 *pix8_from_archive(Jagfile *jag, const char *name, int sprite) {
     size_t name_length = strlen(name) + 5;
-    char *filename = calloc(name_length, sizeof(char));
+    char *filename = pix8_checked_alloc(name_length, sizeof(char), true);
     snprintf(filename, name_length, "%s.dat", name);
 
     Packet *dat = jagfile_to_packet(jag, filename);
@@ -36,7 +47,7 @@ Pix8 *pix8_from_archive(Jagfile *jag, const char *name, int sprite) {
     const int crop_w = g2(idx);
     const int crop_h = g2(idx);
     int palette_count = g1(idx);
-    int *palette = malloc(palette_count * sizeof(int));
+    int *palette = pix8_checked_alloc(1, palette_count * sizeof(int), false);
     palette[0] = 0;
     for (int i = 0; i < palette_count - 1; i++) {
         palette[i + 1] = g3(idx);
@@ -53,7 +64,7 @@ Pix8 *pix8_from_archive(Jagfile *jag, const char *name, int sprite) {
     pix8->height = g2(idx);
     int pixel_order = g1(idx);
     int len = pix8->width * pix8->height;
-    pix8->pixels = calloc(len, sizeof(int8_t));
+    pix8->pixels = pix8_checked_alloc(len, sizeof(int8_t), true);
     if (pixel_order == 0) {
         for (int i = 0; i < len; i++) {
             pix8->pixels[i] = g1b(dat);
@@ -75,7 +86,7 @@ void pix8_shrink(Pix8 *pix8) {
     pix8->crop_w /= 2;
     pix8->crop_h /= 2;
 
-    int8_t *pixels = calloc(pix8->crop_w * pix8->crop_h, sizeof(int8_t));
+    int8_t *pixels = pix8_checked_alloc(pix8->crop_w * pix8->crop_h, sizeof(int8_t), true);
     int off = 0;
     for (int y = 0; y < pix8->height; y++) {
         for (int x = 0; x < pix8->width; x++) {
@@ -96,7 +107,7 @@ void pix8_crop(Pix8 *pix8) {
         return;
     }
 
-    int8_t *pixels = calloc(pix8->crop_w * pix8->crop_h, sizeof(int8_t));
+    int8_t *pixels = pix8_checked_alloc(pix8->crop_w * pix8->crop_h, sizeof(int8_t), true);
     int off = 0;
     for (int y = 0; y < pix8->height; y++) {
         for (int x = 0; x < pix8->width; x++) {
@@ -113,7 +124,7 @@ void pix8_crop(Pix8 *pix8) {
 }
 
 void pix8_flip_horizontally(Pix8 *pix8) {
-    int8_t *pixels = calloc(pix8->width * pix8->height, sizeof(int8_t));
+    int8_t *pixels = pix8_checked_alloc(pix8->width * pix8->height, sizeof(int8_t), true);
     int off = 0;
     for (int y = 0; y < pix8->height; y++) {
         for (int x = pix8->width - 1; x >= 0; x--) {
@@ -127,7 +138,7 @@ void pix8_flip_horizontally(Pix8 *pix8) {
 }
 
 void pix8_flip_vertically(Pix8 *pix8) {
-    int8_t *pixels = calloc(pix8->width * pix8->height, sizeof(int8_t));
+    int8_t *pixels = pix8_checked_alloc(pix8->width * pix8->height, sizeof(int8_t), true);
     int off = 0;
     for (int y = pix8->height - 1; y >= 0; y--) {
         for (int x = 0; x < pix8->width; x++) {

@@ -1,0 +1,2 @@
+#pragma once
+#define HW_R5_SOURCE_ID "3b0377cbbfb0412713e82c74b447b4e0900140e9a7e9decb11101cfc755c838b"

@@ -27,47 +27,36 @@
 #define SCREEN_FB_HEIGHT SCREEN_HEIGHT
 #endif
 
+#ifdef VITA_NATIVE_WIDESCREEN
+#define SCREEN_WIDTH 960
+#define SCREEN_HEIGHT 544
+#else
 #define SCREEN_WIDTH 789
 #define SCREEN_HEIGHT 532
+#endif
 
 #ifdef __vita__
 #define SCREEN_CENTER_XOFF ((SCREEN_FB_WIDTH - SCREEN_WIDTH) / 2)
 #endif
 
 // arbitrary to fix -Wall possible overflow warnings
+// NOTE maybe change the ones using half_str to use strncpy or double sizes but yolo
 #define HALF_STR (CHAT_LENGTH / 2)
+#define SIXTY_STR 60
 #define DOUBLE_STR (CHAT_LENGTH * 2)
+// arbitrary + null terminator
 #define MAX_STR (CHAT_LENGTH + 1)
 
+#define MAX_CHATS 50
+
 // avoid doubles on consoles with only single precision floats or no fpu at all!
-// TODO: double literals haven't been converted to floats use D()
-// TODO: add ps2 here
+// TODO: this doesn't change all occurences of doubles into floats yet
 #if defined(__PSP__) || defined(__NDS__)
-#define D(x) x##f
-typedef float DOUBLE;
-#define POW powf
-#define SQRT sqrtf
-#define COS cosf
-#define SIN sinf
-#define TAN tanf
-#define ATAN2 atan2f
-#else
-#define D(x) x
-typedef double DOUBLE;
-#define POW pow
-#define SQRT sqrt
-#define COS cos
-#define SIN sin
-#define TAN tan
-#define ATAN2 atan2
+#define USE_FLOATS
 #endif
 
-// (2048 / (2 * M_PI))
-#define RADIANS_TO_RS D(325.949)
-#define RADIANS_TO_RS_IMPRECISE D(326.11)
-
 #if defined(_arch_dreamcast) || defined(__NDS__)
-// NOTE: more extreme lowmem mode, making the game mostly explorable on 32 MB
+// NOTE: more extreme lowmem mode, making the game fully explorable on 32 MB
 // -2 MB RAM, may cause some models to be invisible
 #define MODEL_MAX_DEPTH 600
 // -1 MB RAM, may cause buffer overflows
@@ -81,7 +70,6 @@ typedef double DOUBLE;
 #define MODEL_DEPTH_FACE_COUNT 512
 #define PIX3D_POOL_COUNT 20
 #endif
-
 #define LOCBUFFER_COUNT 100
 #define MAX_NPC_COUNT 8192
 #define MAX_PLAYER_COUNT 2048
@@ -93,7 +81,6 @@ typedef double DOUBLE;
 #define CHATBACK_LENGTH 10
 #define REPORT_ABUSE_LENGTH 12
 #define CHAT_LENGTH 80
-#define MAX_CHATS 50
 #define USERNAME_LENGTH 12
 #define PASSWORD_LENGTH 20
 

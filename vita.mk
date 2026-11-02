@@ -47,6 +47,8 @@ CFLAGS += -Wl,-q -std=c99 -marm
 DEPFLAGS := -MMD -MP
 
 SOURCES := $(call rwildcard, src/, *.c)
+include build244.mk
+SOURCES := $(filter-out $(BUILD244_UNITS),$(SOURCES))
 
 OBJ_DIRS := $(sort $(addprefix out/, $(dir $(SOURCES:src/%.c=%.o))))
 OBJS := $(addprefix out/, $(SOURCES:src/%.c=%.o))

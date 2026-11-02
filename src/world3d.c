@@ -1,6 +1,10 @@
+#include "r11_diag.h"
+#include "r10_scene.h"
+#include "ui_preview.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "custom.h"
 #include "datastruct/linklist.h"
@@ -14,10 +18,19 @@
 #include "pix3d.h"
 #include "platform.h"
 #include "world3d.h"
+#include "ba_timing.h"
 #include "allocator.h"
 #include "gl11.h"
+#include "r16_fast.h"
 
 SceneData _World3D = {.lowMemory = true};
+/* 25 tiles fits the Vita. A 50-tile mesh was larger than free RAM, so the
+ * original painter stayed on. Raise it from draw-radius.txt when wanted. */
+static int draw_radius=25;
+static int saved_view_w,saved_view_h,saved_frustum_start,saved_frustum_end,saved_pitch[9];
+int world3d_draw_radius(void){return draw_radius;}
+int world3d_far_clip(void){return 3500*draw_radius/25;}
+
 extern Pix2D _Pix2D;
 extern Pix3D _Pix3D;
 extern TileOverlayData _TileOverlay;
@@ -98,6 +111,7 @@ void world3d_free_global(void) {
 }
 
 void world3d_free(World3D *world3d, int maxTileZ, int maxLevel, int maxTileX) {
+    r10_reset();
     for (int level = 0; level < maxLevel; level++) {
         for (int x = 0; x < maxTileX; x++) {
             for (int z = 0; z < maxTileZ; z++) {
@@ -132,6 +146,10 @@ void world3d_add_occluder(int level, int type, int minX, int minY, int minZ, int
 }
 
 void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int frustumEnd, int *pitchDistance) {
+    saved_view_w=viewportWidth;saved_view_h=viewportHeight;
+    saved_frustum_start=frustumStart;saved_frustum_end=frustumEnd;
+    if(pitchDistance!=saved_pitch)memcpy(saved_pitch,pitchDistance,sizeof(saved_pitch));
+    memset(_World3D.visibilityMatrix,0,8*sizeof(*_World3D.visibilityMatrix));
     _World3D.viewportLeft = 0;
     _World3D.viewportTop = 0;
     _World3D.viewportRight = viewportWidth;
@@ -139,7 +157,8 @@ void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int f
     _World3D.viewportCenterX = viewportWidth / 2;
     _World3D.viewportCenterY = viewportHeight / 2;
 
-    bool (*matrix)[32][53][53] = malloc(9 * sizeof(*matrix));
+    bool (*matrix)[32][WORLD_VIS_SIZE+2][WORLD_VIS_SIZE+2] = calloc(9, sizeof(*matrix));
+    if(!matrix)abort();
     for (int pitch = 128; pitch <= 384; pitch += 32) {
         for (int yaw = 0; yaw < 2048; yaw += 64) {
             _World3D.sinEyePitch = _Pix3D.sin_table[pitch];
@@ -149,8 +168,8 @@ void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int f
 
             int pitchLevel = (pitch - 128) / 32;
             int yawLevel = yaw / 64;
-            for (int dx = -26; dx <= 26; dx++) {
-                for (int dz = -26; dz <= 26; dz++) {
+            for (int dx = -draw_radius-1; dx <= draw_radius+1; dx++) {
+                for (int dz = -draw_radius-1; dz <= draw_radius+1; dz++) {
                     int x = dx * 128;
                     int z = dz * 128;
 
@@ -162,7 +181,7 @@ void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int f
                         }
                     }
 
-                    matrix[pitchLevel][yawLevel][dx + 25 + 1][dz + 25 + 1] = visible;
+                    matrix[pitchLevel][yawLevel][dx + WORLD_VIS_RADIUS + 1][dz + WORLD_VIS_RADIUS + 1] = visible;
                 }
             }
         }
@@ -170,28 +189,28 @@ void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int f
 
     for (int pitchLevel = 0; pitchLevel < 8; pitchLevel++) {
         for (int yawLevel = 0; yawLevel < 32; yawLevel++) {
-            for (int x = -25; x < 25; x++) {
-                for (int z = -25; z < 25; z++) {
+            for (int x = -draw_radius; x < draw_radius; x++) {
+                for (int z = -draw_radius; z < draw_radius; z++) {
 
                     bool visible = false;
                     for (int dx = -1; dx <= 1; dx++) {
                         for (int dz = -1; dz <= 1; dz++) {
-                            if (matrix[pitchLevel][yawLevel][x + dx + 25 + 1][z + dz + 25 + 1]) {
+                            if (matrix[pitchLevel][yawLevel][x + dx + WORLD_VIS_RADIUS + 1][z + dz + WORLD_VIS_RADIUS + 1]) {
                                 visible = true;
                                 goto check_areas_done;
                             }
 
-                            if (matrix[pitchLevel][(yawLevel + 1) % 31][x + dx + 25 + 1][z + dz + 25 + 1]) {
+                            if (matrix[pitchLevel][(yawLevel + 1) % 32][x + dx + WORLD_VIS_RADIUS + 1][z + dz + WORLD_VIS_RADIUS + 1]) {
                                 visible = true;
                                 goto check_areas_done;
                             }
 
-                            if (matrix[pitchLevel + 1][yawLevel][x + dx + 25 + 1][z + dz + 25 + 1]) {
+                            if (matrix[pitchLevel + 1][yawLevel][x + dx + WORLD_VIS_RADIUS + 1][z + dz + WORLD_VIS_RADIUS + 1]) {
                                 visible = true;
                                 goto check_areas_done;
                             }
 
-                            if (matrix[pitchLevel + 1][(yawLevel + 1) % 31][x + dx + 25 + 1][z + dz + 25 + 1]) {
+                            if (matrix[pitchLevel + 1][(yawLevel + 1) % 32][x + dx + WORLD_VIS_RADIUS + 1][z + dz + WORLD_VIS_RADIUS + 1]) {
                                 visible = true;
                                 goto check_areas_done;
                             }
@@ -199,7 +218,7 @@ void world3d_init(int viewportWidth, int viewportHeight, int frustumStart, int f
                     }
 
                 check_areas_done:
-                    _World3D.visibilityMatrix[pitchLevel][yawLevel][x + 25][z + 25] = visible;
+                    _World3D.visibilityMatrix[pitchLevel][yawLevel][x + WORLD_VIS_RADIUS][z + WORLD_VIS_RADIUS] = visible;
                 }
             }
         }
@@ -212,7 +231,7 @@ bool world3d_test_point(int x, int z, int y) {
     int tmp = (z * _World3D.cosEyeYaw - x * _World3D.sinEyeYaw) >> 16;
     int pz = (y * _World3D.sinEyePitch + tmp * _World3D.cosEyePitch) >> 16;
     int py = (y * _World3D.cosEyePitch - tmp * _World3D.sinEyePitch) >> 16;
-    if (pz < 50 || pz > 3500) {
+    if (pz < 50 || pz > world3d_far_clip()) {
         return false;
     }
 
@@ -222,6 +241,7 @@ bool world3d_test_point(int x, int z, int y) {
 }
 
 void world3d_reset(World3D *world3d) {
+    r10_reset();
     for (int level = 0; level < world3d->maxLevel; level++) {
         for (int x = 0; x < world3d->maxTileX; x++) {
             for (int z = 0; z < world3d->maxTileZ; z++) {
@@ -251,9 +271,11 @@ void world3d_reset(World3D *world3d) {
     for (int i = 0; i < LOCBUFFER_COUNT; i++) {
         _World3D.locBuffer[i] = NULL;
     }
+    r16_dirty();
 }
 
 void world3d_set_minlevel(World3D *world3d, int level) {
+    r10_reset();
     world3d->minLevel = level;
 
     for (int stx = 0; stx < world3d->maxTileX; stx++) {
@@ -264,9 +286,11 @@ void world3d_set_minlevel(World3D *world3d, int level) {
             world3d->levelTiles[level][stx][stz] = ground_new(level, stx, stz);
         }
     }
+    r16_dirty();
 }
 
 void world3d_set_bridge(World3D *world3d, int stx, int stz) {
+    r10_dirty_rect(stx-1,stz-1,stx+1,stz+1);
     Ground *ground = world3d->levelTiles[0][stx][stz];
     for (int level = 0; level < 3; level++) {
         world3d->levelTiles[level][stx][stz] = world3d->levelTiles[level + 1][stx][stz];
@@ -285,6 +309,7 @@ void world3d_set_bridge(World3D *world3d, int stx, int stz) {
 }
 
 void world3d_set_drawlevel(World3D *world3d, int level, int stx, int stz, int drawLevel) {
+    r10_dirty_rect(stx,stz,stx,stz);
     Ground *tile = world3d->levelTiles[level][stx][stz];
     if (!tile) {
         return;
@@ -294,6 +319,7 @@ void world3d_set_drawlevel(World3D *world3d, int level, int stx, int stz, int dr
 }
 
 void world3d_set_tile(World3D *world3d, int level, int x, int z, int shape, int angle, int textureId, int southwestY, int southeastY, int northeastY, int northwestY, int southwestColor, int southeastColor, int northeastColor, int northwestColor, int southwestColor2, int southeastColor2, int northeastColor2, int northwestColor2, int backgroundRgb, int foregroundRgb) {
+    r10_dirty_rect(x-1,z-1,x+1,z+1);
     TileUnderlay *underlay;
     int l;
     if (shape == 0) {
@@ -324,11 +350,13 @@ void world3d_set_tile(World3D *world3d, int level, int x, int z, int shape, int 
 }
 
 void world3d_add_grounddecoration(World3D *world3d, Model *model, int tileLevel, int tileX, int tileZ, int y, int bitset, int8_t info) {
+    if(!r16_location_changed(bitset))r10_dirty_rect(tileX,tileZ,tileX,tileZ);
     GroundDecor *decor = calloc(1, sizeof(GroundDecor));
     decor->model = model;
     decor->x = tileX * 128 + 64;
     decor->z = tileZ * 128 + 64;
-    decor->y = y;
+    /* Rug vertices sit on the floor plane. Negative Y is up, so 2 units clears the z-fight. */
+    decor->y = y - 2;
     decor->bitset = bitset;
     decor->info = info;
     if (!world3d->levelTiles[tileLevel][tileX][tileZ]) {
@@ -338,6 +366,7 @@ void world3d_add_grounddecoration(World3D *world3d, Model *model, int tileLevel,
 }
 
 void world3d_add_objstack(World3D *world3d, int stx, int stz, int y, int level, int bitset, Model *topObj, Model *middleObj, Model *bottomObj) {
+    r16_grounditem_changed(stx,stz);
     GroundObject *stack = calloc(1, sizeof(GroundObject));
     stack->topObj = topObj;
     stack->x = stx * 128 + 64;
@@ -360,10 +389,13 @@ void world3d_add_objstack(World3D *world3d, int stx, int stz, int y, int level, 
     if (!world3d->levelTiles[level][stx][stz]) {
         world3d->levelTiles[level][stx][stz] = ground_new(level, stx, stz);
     }
+    /* Stack replacement owns the small holder, not the cached item models. */
+    free(world3d->levelTiles[level][stx][stz]->groundObj);
     world3d->levelTiles[level][stx][stz]->groundObj = stack;
 }
 
 void world3d_add_wall(World3D *world3d, int level, int tileX, int tileZ, int y, int typeA, int typeB, Model *modelA, Model *modelB, int bitset, int8_t info) {
+    if(!r16_location_changed(bitset))r10_dirty_rect(tileX,tileZ,tileX,tileZ);
     if (!modelA && !modelB) {
         return;
     }
@@ -387,6 +419,7 @@ void world3d_add_wall(World3D *world3d, int level, int tileX, int tileZ, int y, 
 }
 
 void world3d_set_walldecoration(World3D *world3d, int level, int tileX, int tileZ, int y, int offsetX, int offsetZ, int bitset, Model *model, int8_t info, int angle, int type) {
+    if(!r16_location_changed(bitset))r10_dirty_rect(tileX,tileZ,tileX,tileZ);
     if (!model) {
         return;
     }
@@ -452,6 +485,7 @@ bool world3d_add_temporary2(World3D *world3d, int level, int x, int y, int z, in
 }
 
 bool world3d_add_loc2(World3D *world3d, int x, int z, int y, int level, int tileX, int tileZ, int tileSizeX, int tileSizeZ, Model *model, Entity *entity, int bitset, int8_t info, int yaw, bool temporary) {
+    if(!temporary&&!r16_location_changed(bitset))r10_dirty_rect(tileX,tileZ,tileX+tileSizeX-1,tileZ+tileSizeZ-1);
     if (!model && !entity) {
         return false;
     }
@@ -467,6 +501,7 @@ bool world3d_add_loc2(World3D *world3d, int x, int z, int y, int level, int tile
         }
     }
     Location *loc = rs2_calloc(!temporary, 1, sizeof(Location));
+    loc->r10_temporary=temporary;
     loc->bitset = bitset;
     loc->info = info;
     loc->level = level;
@@ -527,6 +562,7 @@ void world3d_clear_temporarylocs(World3D *world3d) {
 }
 
 void world3d_remove_loc2(World3D *world3d, Location *loc) {
+    if(loc && !loc->r10_temporary&&!r16_location_changed(loc->bitset))r10_dirty_rect(loc->minSceneTileX,loc->minSceneTileZ,loc->maxSceneTileX,loc->maxSceneTileZ);
     for (int tx = loc->minSceneTileX; tx <= loc->maxSceneTileX; tx++) {
         for (int tz = loc->minSceneTileZ; tz <= loc->maxSceneTileZ; tz++) {
             Ground *tile = world3d->levelTiles[loc->level][tx][tz];
@@ -556,6 +592,8 @@ void world3d_remove_loc2(World3D *world3d, Location *loc) {
 }
 
 void world3d_set_locmodel(World3D *world3d, int level, int x, int z, Model *model) {
+    int live_bitset=world3d_get_locbitset(world3d,level,x,z);
+    if ((!model || !model->r10_animated)&&!r16_location_changed(live_bitset)) r10_dirty_rect(x,z,x,z);
     if (!model) {
         return;
     }
@@ -589,6 +627,7 @@ void world3d_set_walldecorationoffset(World3D *world3d, int level, int x, int z,
         return;
     }
 
+    if(!r16_location_changed(decor->bitset))r10_dirty_rect(x,z,x,z);
     int sx = x * 128 + 64;
     int sz = z * 128 + 64;
     decor->x = sx + (decor->x - sx) * offset / 16;
@@ -596,6 +635,8 @@ void world3d_set_walldecorationoffset(World3D *world3d, int level, int x, int z,
 }
 
 void world3d_set_walldecorationmodel(World3D *world3d, int level, int x, int z, Model *model) {
+    Ground *live_tile=world3d->levelTiles[level][x][z];
+    if ((!model || !model->r10_animated)&&(!live_tile||!live_tile->decor||!r16_location_changed(live_tile->decor->bitset)))r10_dirty_rect(x,z,x,z);
     if (!model) {
         return;
     }
@@ -619,6 +660,8 @@ void world3d_set_walldecorationmodel(World3D *world3d, int level, int x, int z, 
 }
 
 void world3d_set_grounddecorationmodel(World3D *world3d, int level, int x, int z, Model *model) {
+    Ground *live_tile=world3d->levelTiles[level][x][z];
+    if ((!model || !model->r10_animated)&&(!live_tile||!live_tile->groundDecor||!r16_location_changed(live_tile->groundDecor->bitset)))r10_dirty_rect(x,z,x,z);
     if (!model) {
         return;
     }
@@ -642,6 +685,8 @@ void world3d_set_grounddecorationmodel(World3D *world3d, int level, int x, int z
 }
 
 void world3d_set_wallmodel(World3D *world3d, int level, int x, int z, Model *model) {
+    Ground *live_tile=world3d->levelTiles[level][x][z];
+    if (!model || !model->r10_animated) {if(!live_tile||!live_tile->wall||!r16_location_changed(live_tile->wall->bitset))r10_dirty_rect(x,z,x,z);}
     if (!model) {
         return;
     }
@@ -665,6 +710,8 @@ void world3d_set_wallmodel(World3D *world3d, int level, int x, int z, Model *mod
 }
 
 void world3d_set_wallmodels(World3D *world3d, int x, int z, int level, Model *modelA, Model *modelB) {
+    Ground *live_tile=world3d->levelTiles[level][x][z];
+    if (!modelA || !modelA->r10_animated || (modelB && !modelB->r10_animated)) {if(!live_tile||!live_tile->wall||!r16_location_changed(live_tile->wall->bitset))r10_dirty_rect(x,z,x,z);}
     if (!modelA) {
         return;
     }
@@ -694,6 +741,7 @@ void world3d_set_wallmodels(World3D *world3d, int x, int z, int level, Model *mo
 
 void world3d_remove_wall(World3D *world3d, int level, int x, int z, int force) {
     Ground *tile = world3d->levelTiles[level][x][z];
+    if(!tile||!tile->wall||!r16_location_changed(tile->wall->bitset))r10_dirty_rect(x,z,x,z);
     if (force == 1 && tile) {
         free(tile->wall);
         tile->wall = NULL;
@@ -702,6 +750,7 @@ void world3d_remove_wall(World3D *world3d, int level, int x, int z, int force) {
 
 void world3d_remove_walldecoration(World3D *world3d, int level, int x, int z) {
     Ground *tile = world3d->levelTiles[level][x][z];
+    if(!tile||!tile->decor||!r16_location_changed(tile->decor->bitset))r10_dirty_rect(x,z,x,z);
     if (!tile) {
         return;
     }
@@ -727,6 +776,7 @@ void world3d_remove_loc(World3D *world3d, int level, int x, int z) {
 
 void world3d_remove_grounddecoration(World3D *world3d, int level, int x, int z) {
     Ground *tile = world3d->levelTiles[level][x][z];
+    if(!tile||!tile->groundDecor||!r16_location_changed(tile->groundDecor->bitset))r10_dirty_rect(x,z,x,z);
     if (!tile) {
         return;
     }
@@ -741,6 +791,7 @@ void world3d_remove_objstack(World3D *world3d, int level, int x, int z) {
         return;
     }
 
+    if(tile->groundObj)r16_grounditem_changed(x,z);
     free(tile->groundObj);
     tile->groundObj = NULL;
 }
@@ -797,8 +848,18 @@ int world3d_get_info(World3D *world3d, int level, int x, int z, int bitset) {
     }
 }
 
+#include "r34_normal_index.h"
+static uint64_t region_merge_us;
+static unsigned region_merge_calls;
+static int region_merge_profile;
+extern void ba_cadence_diagnostic(const char *line);
 void world3d_build_models(World3D *world3d, int lightAmbient, int lightAttenuation, int lightSrcX, int lightSrcY, int lightSrcZ) {
-    int lightMagnitude = (int)SQRT(lightSrcX * lightSrcX + lightSrcY * lightSrcY + lightSrcZ * lightSrcZ);
+    uint64_t lighting_at=ba_timing_now();region_merge_us=0;region_merge_calls=0;r34_reset();
+    /* Per-pair timing is diagnostic only; keep it out of normal loading. */
+    {FILE*f=fopen("ux0:/data/RS2Vita/model-profile.txt","r");int requested=0;if(f){fscanf(f,"%d",&requested);fclose(f);}region_merge_profile=requested==1;}
+
+    r10_reset();
+    int lightMagnitude = (int)sqrt(lightSrcX * lightSrcX + lightSrcY * lightSrcY + lightSrcZ * lightSrcZ);
     int attenuation = lightAttenuation * lightMagnitude >> 8;
 
     for (int level = 0; level < world3d->maxLevel; level++) {
@@ -836,6 +897,10 @@ void world3d_build_models(World3D *world3d, int lightAmbient, int lightAttenuati
             }
         }
     }
+    r16_dirty();
+    char phase_line[192];
+    snprintf(phase_line,sizeof phase_line,"# world_lighting %llu merges %u merge_us %llu total %llu indexed_hits %u indexed_builds %u",(unsigned long long)ba_timing_now(),region_merge_calls,(unsigned long long)region_merge_us,(unsigned long long)(ba_timing_now()-lighting_at),r34_cache_hits,r34_builds);
+    ba_cadence_diagnostic(phase_line);
 }
 
 void world3d_merge_grounddecorationnormals(World3D *world3d, int level, int tileX, int tileZ, Model *model) {
@@ -927,11 +992,14 @@ void world3d_merge_locnormals(World3D *world3d, int level, int tileX, int tileZ,
 }
 
 void world3d_merge_normals(World3D *world3d, Model *modelA, Model *modelB, int offsetX, int offsetY, int offsetZ, bool allowFaceRemoval) {
+    uint64_t merge_at=region_merge_profile?ba_timing_now():0;region_merge_calls++;
+    r10_model_changed(modelA);r10_model_changed(modelB);
     world3d->tmpMergeIndex++;
 
     int merged = 0;
     int *vertexX = modelB->vertices_x;
     int vertexCountB = modelB->vertex_count;
+    int indexed=-1;
 
     for (int vertexA = 0; vertexA < modelA->vertex_count; vertexA++) {
         VertexNormal *normalA = modelA->vertex_normal[vertexA];
@@ -952,7 +1020,8 @@ void world3d_merge_normals(World3D *world3d, Model *modelA, Model *modelB, int o
                 continue;
             }
 
-            for (int vertexB = 0; vertexB < vertexCountB; vertexB++) {
+            if(indexed<0)indexed=r34_prepare(vertexX,modelB->vertices_y,modelB->vertices_z,modelA->vertex_count,vertexCountB);
+            for (int vertexB = indexed?r34_heads[r34_hash(x,y,z)]:0; vertexB>=0 && vertexB < vertexCountB; vertexB=indexed?r34_next[vertexB]:vertexB+1) {
                 VertexNormal *normalB = modelB->vertex_normal[vertexB];
                 VertexNormal *originalNormalB = modelB->vertex_normal_original[vertexB];
                 if (x != vertexX[vertexB] || z != modelB->vertices_z[vertexB] || y != modelB->vertices_y[vertexB] || originalNormalB->w == 0) {
@@ -974,21 +1043,14 @@ void world3d_merge_normals(World3D *world3d, Model *modelA, Model *modelB, int o
         }
     }
 
-    if (merged < 3 || !allowFaceRemoval) {
-        return;
-    }
-
-    for (int i = 0; i < modelA->face_count; i++) {
-        if (world3d->mergeIndexA[modelA->face_indices_a[i]] == world3d->tmpMergeIndex && world3d->mergeIndexA[modelA->face_indices_b[i]] == world3d->tmpMergeIndex && world3d->mergeIndexA[modelA->face_indices_c[i]] == world3d->tmpMergeIndex) {
-            modelA->face_infos[i] = -1;
-        }
-    }
-
-    for (int i = 0; i < modelB->face_count; i++) {
-        if (world3d->mergeIndexB[modelB->face_indices_a[i]] == world3d->tmpMergeIndex && world3d->mergeIndexB[modelB->face_indices_b[i]] == world3d->tmpMergeIndex && world3d->mergeIndexB[modelB->face_indices_c[i]] == world3d->tmpMergeIndex) {
-            modelB->face_infos[i] = -1;
-        }
-    }
+    /* The software rasterizer deletes both caps once the three vertices
+     * match. Doing that here left the GL joint open: the unlit cap was
+     * the white strip, and omitting it shows the black clear color.
+     * Merged normals stay. The caps keep their materials and are shaded
+     * with the other faces. Backface culling hides the opposite cap. */
+    (void)merged;
+    if(region_merge_profile)region_merge_us+=ba_timing_now()-merge_at;
+    (void)allowFaceRemoval;
 }
 
 void world3d_draw_minimaptile(World3D *world3d, int level, int x, int z, int *dst, int offset, int step) {
@@ -1000,6 +1062,7 @@ void world3d_draw_minimaptile(World3D *world3d, int level, int x, int z, int *ds
     TileUnderlay *underlay = tile->underlay;
     if (underlay) {
         int rgb = underlay->rgb;
+        if(ui_water_preview()&&(underlay->textureId==1||underlay->textureId==17||underlay->textureId==24))rgb=0x406080;
         if (rgb == 0) {
             return;
         }
@@ -1024,6 +1087,7 @@ void world3d_draw_minimaptile(World3D *world3d, int level, int x, int z, int *ds
     int angle = overlay->rotation;
     int background = overlay->backgroundRgb;
     int foreground = overlay->foregroundRgb;
+    if(ui_water_preview()&&overlay->triangleTextureIds)for(int i=0;i<overlay->triangleCount;i++)if(overlay->triangleTextureIds[i]==1||overlay->triangleTextureIds[i]==17||overlay->triangleTextureIds[i]==24){background=foreground=0x406080;break;}
     const int *mask = MINIMAP_OVERLAY_SHAPE[shape];
     const int *rotation = MINIMAP_OVERLAY_ROTATION[angle];
 
@@ -1070,6 +1134,28 @@ void world3d_click(int mouseX, int mouseY) {
 }
 
 void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, int eyeYaw, int eyePitch, int loopCycle) {
+ R11_SCOPE(R11_TRAVERSE);
+#ifdef BUILD_A_EMBEDDED
+    static uint64_t next_setting;
+    uint64_t settings_now=rs2_now();
+    if(settings_now>=next_setting){
+        uint64_t io0=ba_timing_now();
+        int verbose=r16_diag_verbose();
+        next_setting=verbose?settings_now+1000ull:UINT64_MAX;
+        int requested=draw_radius;FILE *setting=fopen("ux0:/data/RS2Vita/draw-radius.txt","r");
+        if(setting){if(fscanf(setting,"%d",&requested)!=1)requested=draw_radius;fclose(setting);}
+        if(requested>=25&&requested<=WORLD_VIS_RADIUS&&requested!=draw_radius){
+            draw_radius=requested;
+            world3d_init(saved_view_w,saved_view_h,saved_frustum_start,saved_frustum_end,saved_pitch);
+        }
+        if(verbose){
+            FILE *log=fopen("ux0:/data/RS2Vita/draw-distance.csv","a");
+            if(log){fprintf(log,"%llu,%d,%d,%d,%d,%d,%d,%d\n",(unsigned long long)ba_timing_now(),draw_radius,eyeX/128,eyeZ/128,world3d->maxTileX,world3d->maxTileZ,world3d_far_clip(),WORLD_VIS_SIZE);fclose(log);}
+        }
+        r16_io_add(1,ba_timing_now()-io0);
+    }
+#endif
+
     if (eyeX < 0) {
         eyeX = 0;
     } else if (eyeX >= world3d->maxTileX * 128) {
@@ -1096,25 +1182,32 @@ void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, 
     _World3D.eyeTileZ = eyeZ / 128;
     _World3D.topLevel = topLevel;
 
-    _World3D.minDrawTileX = _World3D.eyeTileX - 25;
+    _World3D.minDrawTileX = _World3D.eyeTileX - draw_radius;
     if (_World3D.minDrawTileX < 0) {
         _World3D.minDrawTileX = 0;
     }
 
-    _World3D.minDrawTileZ = _World3D.eyeTileZ - 25;
+    _World3D.minDrawTileZ = _World3D.eyeTileZ - draw_radius;
     if (_World3D.minDrawTileZ < 0) {
         _World3D.minDrawTileZ = 0;
     }
 
-    _World3D.maxDrawTileX = _World3D.eyeTileX + 25;
+    _World3D.maxDrawTileX = _World3D.eyeTileX + draw_radius;
     if (_World3D.maxDrawTileX > world3d->maxTileX) {
         _World3D.maxDrawTileX = world3d->maxTileX;
     }
 
-    _World3D.maxDrawTileZ = _World3D.eyeTileZ + 25;
+    _World3D.maxDrawTileZ = _World3D.eyeTileZ + draw_radius;
     if (_World3D.maxDrawTileZ > world3d->maxTileZ) {
         _World3D.maxDrawTileZ = world3d->maxTileZ;
     }
+
+#ifdef GL11
+    if (_Custom.use_opengl11 && r16_prepare(world3d, topLevel, loopCycle)) {
+        _World3D.takingInput = false;
+        return;
+    }
+#endif
 
     world3d_update_activeoccluders();
     _World3D.tilesRemaining = 0;
@@ -1128,7 +1221,7 @@ void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, 
                     continue;
                 }
 
-                if (tile->drawLevel <= topLevel && (_World3D.visibilityMap[x + 25 - _World3D.eyeTileX][z + 25 - _World3D.eyeTileZ] || world3d->levelHeightmaps[level][x][z] - eyeY >= 2000)) {
+                if (tile->drawLevel <= topLevel && (_World3D.visibilityMap[x + WORLD_VIS_RADIUS - _World3D.eyeTileX][z + WORLD_VIS_RADIUS - _World3D.eyeTileZ] || world3d->levelHeightmaps[level][x][z] - eyeY >= 2000)) {
                     tile->visible = true;
                     tile->update = true;
                     tile->containsLocs = tile->locCount > 0;
@@ -1144,7 +1237,7 @@ void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, 
 
     for (int level = world3d->minLevel; level < world3d->maxLevel; level++) {
         Ground ***tiles = world3d->levelTiles[level];
-        for (int dx = -25; dx <= 0; dx++) {
+        for (int dx = -draw_radius; dx <= 0; dx++) {
             int rightTileX = _World3D.eyeTileX + dx;
             int leftTileX = _World3D.eyeTileX - dx;
 
@@ -1152,7 +1245,7 @@ void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, 
                 continue;
             }
 
-            for (int dz = -25; dz <= 0; dz++) {
+            for (int dz = -draw_radius; dz <= 0; dz++) {
                 int forwardTileZ = _World3D.eyeTileZ + dz;
                 int backwardTileZ = _World3D.eyeTileZ - dz;
                 Ground *tile;
@@ -1198,14 +1291,14 @@ void world3d_draw(World3D *world3d, int eyeX, int eyeY, int eyeZ, int topLevel, 
 
     for (int level = world3d->minLevel; level < world3d->maxLevel; level++) {
         Ground ***tiles = world3d->levelTiles[level];
-        for (int dx = -25; dx <= 0; dx++) {
+        for (int dx = -draw_radius; dx <= 0; dx++) {
             int rightTileX = _World3D.eyeTileX + dx;
             int leftTileX = _World3D.eyeTileX - dx;
             if (rightTileX < _World3D.minDrawTileX && leftTileX >= _World3D.maxDrawTileX) {
                 continue;
             }
 
-            for (int dz = -25; dz <= 0; dz++) {
+            for (int dz = -draw_radius; dz <= 0; dz++) {
                 int forwardTileZ = _World3D.eyeTileZ + dz;
                 int backgroundTileZ = _World3D.eyeTileZ - dz;
                 Ground *tile;
@@ -1330,7 +1423,9 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
 
                 Wall *wall = bridge->wall;
                 if (wall) {
+                    r10_hint(1);
                     model_draw(wall->modelA, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
 
                 for (int i = 0; i < bridge->locCount; i++) {
@@ -1344,7 +1439,9 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                             _free = true;
                         }
 
+                        r10_hint(!_free && !loc->entity && !loc->r10_temporary);
                         model_draw(model, loc->yaw, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, loc->x - _World3D.eyeX, loc->y - _World3D.eyeY, loc->z - _World3D.eyeZ, loc->bitset);
+                        r10_hint(0);
                         if (_free) {
                             entity_draw_free(loc->entity, model, loopCycle);
                         }
@@ -1408,17 +1505,23 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                 }
 
                 if ((wall->typeA & frontWallTypes) != 0 && !world3d_wall_visible(world3d, occludeLevel, tileX, tileZ, wall->typeA)) {
+                    r10_hint(1);
                     model_draw(wall->modelA, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
 
                 if ((wall->typeB & frontWallTypes) != 0 && !world3d_wall_visible(world3d, occludeLevel, tileX, tileZ, wall->typeB)) {
+                    r10_hint(1);
                     model_draw(wall->modelB, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
             }
 
             if (decor && !world3d_visible(world3d, occludeLevel, tileX, tileZ, decor->model->max_y)) {
                 if ((decor->type & frontWallTypes) != 0) {
+                    r10_hint(1);
                     model_draw(decor->model, decor->angle, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, decor->x - _World3D.eyeX, decor->y - _World3D.eyeY, decor->z - _World3D.eyeZ, decor->bitset);
+                    r10_hint(0);
                 } else if ((decor->type & 0x300) != 0) {
                     int x = decor->x - _World3D.eyeX;
                     int y = decor->y - _World3D.eyeY;
@@ -1442,13 +1545,17 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                     if ((decor->type & 0x100) != 0 && nearestZ < nearestX) {
                         int drawX = x + WALL_DECORATION_INSET_X[rotation];
                         int drawZ = z + WALL_DECORATION_INSET_Z[rotation];
+                        r10_hint(1);
                         model_draw(decor->model, rotation * 512 + 256, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, drawX, y, drawZ, decor->bitset);
+                        r10_hint(0);
                     }
 
                     if ((decor->type & 0x200) != 0 && nearestZ > nearestX) {
                         int drawX = x + WALL_DECORATION_OUTSET_X[rotation];
                         int drawZ = z + WALL_DECORATION_OUTSET_Z[rotation];
+                        r10_hint(1);
                         model_draw(decor->model, rotation * 512 + 1280 & 0x7ff, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, drawX, y, drawZ, decor->bitset);
+                        r10_hint(0);
                     }
                 }
             }
@@ -1456,21 +1563,29 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
             if (tileDrawn) {
                 GroundDecor *groundDecor = tile->groundDecor;
                 if (groundDecor) {
+                    r10_hint(1);
                     model_draw(groundDecor->model, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, groundDecor->x - _World3D.eyeX, groundDecor->y - _World3D.eyeY, groundDecor->z - _World3D.eyeZ, groundDecor->bitset);
+                    r10_hint(0);
                 }
 
                 GroundObject *objs = tile->groundObj;
                 if (objs && objs->offset == 0) {
                     if (objs->bottomObj) {
+                        r10_hint(0);
                         model_draw(objs->bottomObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY, objs->z - _World3D.eyeZ, objs->bitset);
+                        r10_hint(0);
                     }
 
                     if (objs->middleObj) {
+                        r10_hint(0);
                         model_draw(objs->middleObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY, objs->z - _World3D.eyeZ, objs->bitset);
+                        r10_hint(0);
                     }
 
                     if (objs->topObj) {
+                        r10_hint(0);
                         model_draw(objs->topObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY, objs->z - _World3D.eyeZ, objs->bitset);
+                        r10_hint(0);
                     }
                 }
             }
@@ -1521,7 +1636,9 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                 Wall *wall = tile->wall;
 
                 if (!world3d_wall_visible(world3d, occludeLevel, tileX, tileZ, wall->typeA)) {
+                    r10_hint(1);
                     model_draw(wall->modelA, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
 
                 tile->checkLocSpans = 0;
@@ -1627,7 +1744,9 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                 }
 
                 if (!world3d_loc_visible(world3d, occludeLevel, farthest->minSceneTileX, farthest->maxSceneTileX, farthest->minSceneTileZ, farthest->maxSceneTileZ, model->max_y)) {
+                    r10_hint(!_free && !farthest->entity && !farthest->r10_temporary);
                     model_draw(model, farthest->yaw, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, farthest->x - _World3D.eyeX, farthest->y - _World3D.eyeY, farthest->z - _World3D.eyeZ, farthest->bitset);
+                    r10_hint(0);
                 }
                 if (_free) {
                     entity_draw_free(farthest->entity, model, loopCycle);
@@ -1689,15 +1808,21 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
         GroundObject *objs = tile->groundObj;
         if (objs && objs->offset != 0) {
             if (objs->bottomObj) {
+                r10_hint(0);
                 model_draw(objs->bottomObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY - objs->offset, objs->z - _World3D.eyeZ, objs->bitset);
+                r10_hint(0);
             }
 
             if (objs->middleObj) {
+                r10_hint(0);
                 model_draw(objs->middleObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY - objs->offset, objs->z - _World3D.eyeZ, objs->bitset);
+                r10_hint(0);
             }
 
             if (objs->topObj) {
+                r10_hint(0);
                 model_draw(objs->topObj, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, objs->x - _World3D.eyeX, objs->y - _World3D.eyeY - objs->offset, objs->z - _World3D.eyeZ, objs->bitset);
+                r10_hint(0);
             }
         }
 
@@ -1706,7 +1831,9 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
 
             if (decor && !world3d_visible(world3d, occludeLevel, tileX, tileZ, decor->model->max_y)) {
                 if ((decor->type & tile->backWallTypes) != 0) {
+                    r10_hint(1);
                     model_draw(decor->model, decor->angle, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, decor->x - _World3D.eyeX, decor->y - _World3D.eyeY, decor->z - _World3D.eyeZ, decor->bitset);
+                    r10_hint(0);
                 } else if ((decor->type & 0x300) != 0) {
                     int x = decor->x - _World3D.eyeX;
                     int y = decor->y - _World3D.eyeY;
@@ -1730,13 +1857,17 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
                     if ((decor->type & 0x100) != 0 && nearestZ >= nearestX) {
                         int drawX = x + WALL_DECORATION_INSET_X[rotation];
                         int drawZ = z + WALL_DECORATION_INSET_Z[rotation];
+                        r10_hint(1);
                         model_draw(decor->model, rotation * 512 + 256, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, drawX, y, drawZ, decor->bitset);
+                        r10_hint(0);
                     }
 
                     if ((decor->type & 0x200) != 0 && nearestZ <= nearestX) {
                         int drawX = x + WALL_DECORATION_OUTSET_X[rotation];
                         int drawZ = z + WALL_DECORATION_OUTSET_Z[rotation];
+                        r10_hint(1);
                         model_draw(decor->model, rotation * 512 + 1280 & 0x7ff, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, drawX, y, drawZ, decor->bitset);
+                        r10_hint(0);
                     }
                 }
             }
@@ -1744,11 +1875,15 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
             Wall *wall = tile->wall;
             if (wall) {
                 if ((wall->typeB & tile->backWallTypes) != 0 && !world3d_wall_visible(world3d, occludeLevel, tileX, tileZ, wall->typeB)) {
+                    r10_hint(1);
                     model_draw(wall->modelB, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
 
                 if ((wall->typeA & tile->backWallTypes) != 0 && !world3d_wall_visible(world3d, occludeLevel, tileX, tileZ, wall->typeA)) {
+                    r10_hint(1);
                     model_draw(wall->modelA, 0, _World3D.sinEyePitch, _World3D.cosEyePitch, _World3D.sinEyeYaw, _World3D.cosEyeYaw, wall->x - _World3D.eyeX, wall->y - _World3D.eyeY, wall->z - _World3D.eyeZ, wall->bitset);
+                    r10_hint(0);
                 }
             }
         }
@@ -1792,7 +1927,13 @@ void world3d_draw_tile(World3D *world3d, Ground *next, bool checkAdjacent, int l
 
 void world3d_draw_tileunderlay(World3D *world3d, TileUnderlay *underlay, int level, int tileX, int tileZ, int sinEyePitch, int cosEyePitch, int sinEyeYaw, int cosEyeYaw) {
 #ifdef GL11
-    if (_Custom.use_opengl11) {
+#if BA_R10_CACHE
+    int r10_hit=_Custom.use_opengl11?r10_surface_begin(underlay,1,tileX,tileZ,level,underlay->textureId==17||underlay->textureId==24):0;
+    uint64_t r10_emit_at=ba_timing_now();
+#else
+    const int r10_hit=0;
+#endif
+    if (_Custom.use_opengl11 && !r10_hit && !r16_suppress_emit()) {
         if (underlay->southwestColor == 12345678 && underlay->northeastColor == 12345678) {
             return;
         }
@@ -1818,33 +1959,43 @@ void world3d_draw_tileunderlay(World3D *world3d, TileUnderlay *underlay, int lev
 
         // Software renderer has wrong texture coordinates
         if (underlay->northeastColor != 12345678) {
+            gl_reserve_geometry(3,3);
             indices[elementcount++] = vertcount;
             indices[elementcount++] = vertcount + 1;
             indices[elementcount++] = vertcount + 2;
             if (underlay->flat) {
                 if (textureId != -1) {
-                    gl_texture_triangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, (UV){texCoordU11, texCoordU01, texCoordU10, texCoordV11, texCoordV01, texCoordV10}, textureId);
+                    glTextureTriangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, (UV){texCoordU11, texCoordU01, texCoordU10, texCoordV11, texCoordV01, texCoordV10}, textureId);
                 } else {
-                    gl_gouraud_triangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, 0xff);
+                    glGouraudTriangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, 0xff);
                 }
             } else {
                 if (textureId != -1) {
-                    gl_texture_triangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, (UV){texCoordU00, texCoordU10, texCoordU01, texCoordV00, texCoordV10, texCoordV01}, textureId);
+                    glTextureTriangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, (UV){texCoordU00, texCoordU10, texCoordU01, texCoordV00, texCoordV10, texCoordV01}, textureId);
                 } else {
-                    gl_gouraud_triangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, 0xff);
+                    glGouraudTriangle(x1, x0, x1, y11, y01, y10, z1, z1, z0, underlay->northeastColor, underlay->northwestColor, underlay->southeastColor, 0xff);
                 }
             }
             if (underlay->southwestColor != 12345678) {
-                indices[elementcount++] = vertcount;
+                gl_reserve_geometry(3,3);
+            indices[elementcount++] = vertcount;
                 indices[elementcount++] = vertcount + 1;
                 indices[elementcount++] = vertcount + 2;
                 if (textureId != -1) {
-                    gl_texture_triangle(x0, x1, x0, y00, y10, y01, z0, z0, z1, underlay->southwestColor, underlay->southeastColor, underlay->northwestColor, (UV){texCoordU00, texCoordU10, texCoordU01, texCoordV00, texCoordV10, texCoordV01}, textureId);
+                    glTextureTriangle(x0, x1, x0, y00, y10, y01, z0, z0, z1, underlay->southwestColor, underlay->southeastColor, underlay->northwestColor, (UV){texCoordU00, texCoordU10, texCoordU01, texCoordV00, texCoordV10, texCoordV01}, textureId);
                 } else {
-                    gl_gouraud_triangle(x0, x1, x0, y00, y10, y01, z0, z0, z1, underlay->southwestColor, underlay->southeastColor, underlay->northwestColor, 0xff);
+                    glGouraudTriangle(x0, x1, x0, y00, y10, y01, z0, z0, z1, underlay->southwestColor, underlay->southeastColor, underlay->northwestColor, 0xff);
                 }
             }
         }
+    }
+#if BA_R10_CACHE
+    if(_Custom.use_opengl11 && !r10_hit){r10_emit_time(ba_timing_now()-r10_emit_at);r10_surface_end();}
+#endif
+#endif
+#ifdef GL11
+    if (_Custom.use_opengl11 && !r16_suppress_emit() && (r16_baking() || !_World3D.takingInput)) {
+        return;
     }
 #endif
     int x3;
@@ -1972,7 +2123,13 @@ void world3d_draw_tileunderlay(World3D *world3d, TileUnderlay *underlay, int lev
 }
 
 void world3d_draw_tileoverlay(int tileX, int tileZ, TileOverlay *overlay, int sinEyePitch, int cosEyePitch, int sinEyeYaw, int cosEyeYaw) {
-    for (int i = 0; i < overlay->vertexCount; i++) {
+    int vertexCount = overlay->vertexCount;
+    int draw_cpu_tile = 1;
+#ifdef GL11
+    draw_cpu_tile = !(_Custom.use_opengl11 && !r16_suppress_emit() && (r16_baking() || !_World3D.takingInput));
+#endif
+    if (draw_cpu_tile) {
+    for (int i = 0; i < vertexCount; i++) {
         int x = overlay->vertexX[i] - _World3D.eyeX;
         int y = overlay->vertexY[i] - _World3D.eyeY;
         int z = overlay->vertexZ[i] - _World3D.eyeZ;
@@ -1996,12 +2153,24 @@ void world3d_draw_tileoverlay(int tileX, int tileZ, TileOverlay *overlay, int si
         }
         _TileOverlay.tmpScreenX[i] = _Pix3D.center_x + (x << 9) / z;
         _TileOverlay.tmpScreenY[i] = _Pix3D.center_y + (y << 9) / z;
+    }
+    }
 
 #ifdef GL11
-        if (_Custom.use_opengl11) {
-            int sceneX = tileX * 128;
-            int sceneZ = tileZ * 128;
+#if BA_R10_CACHE
+    int r10_animated_overlay=0;
+    if(overlay->triangleTextureIds)for(int k=0;k<overlay->triangleCount;k++)if(overlay->triangleTextureIds[k]==17||overlay->triangleTextureIds[k]==24)r10_animated_overlay=1;
+    int r10_hit=_Custom.use_opengl11?r10_surface_begin(overlay,2,tileX,tileZ,0,r10_animated_overlay):0;
+    uint64_t r10_emit_at=ba_timing_now();
+#else
+    const int r10_hit=0;
+#endif
+    if (_Custom.use_opengl11 && !r10_hit && !r16_suppress_emit()) {
+        int sceneX = tileX * 128;
+        int sceneZ = tileZ * 128;
 
+        // NOTE this loop doesn't need to be separate from above
+        for (int i = 0; i < vertexCount; i++) {
             if (overlay->triangleTextureIds) {
                 int tmpX = overlay->vertexX[i] - sceneX;
                 int tmpZ = overlay->vertexZ[i] - sceneZ;
@@ -2010,12 +2179,9 @@ void world3d_draw_tileoverlay(int tileX, int tileZ, TileOverlay *overlay, int si
                 _TileOverlay.tmpV[i] = tmpZ / 128.0;
             }
         }
-#endif
-    }
 
-#ifdef GL11
-    if (_Custom.use_opengl11) {
-        for (int i = 0; i < overlay->triangleCount; i++) {
+        vertexCount = overlay->triangleCount;
+        for (int i = 0; i < vertexCount; i++) {
             int a = overlay->triangleVertexA[i];
             int b = overlay->triangleVertexB[i];
             int c = overlay->triangleVertexC[i];
@@ -2044,28 +2210,36 @@ void world3d_draw_tileoverlay(int tileX, int tileZ, TileOverlay *overlay, int si
                 continue;
             }
 
+            gl_reserve_geometry(3,3);
             indices[elementcount++] = vertcount;
             indices[elementcount++] = vertcount + 1;
             indices[elementcount++] = vertcount + 2;
             if (overlay->flat) {
                 if (textureId != -1) {
-                    gl_texture_triangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, (UV){_TileOverlay.tmpU[a], _TileOverlay.tmpU[b], _TileOverlay.tmpU[c], _TileOverlay.tmpV[a], _TileOverlay.tmpV[b], _TileOverlay.tmpV[c]}, textureId);
+                    glTextureTriangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, (UV){_TileOverlay.tmpU[a], _TileOverlay.tmpU[b], _TileOverlay.tmpU[c], _TileOverlay.tmpV[a], _TileOverlay.tmpV[b], _TileOverlay.tmpV[c]}, textureId);
                 } else {
-                    gl_gouraud_triangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, 0xff);
+                    glGouraudTriangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, 0xff);
                 }
             } else {
                 if (textureId != -1) {
-                    gl_texture_triangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, (UV){_TileOverlay.tmpU[0], _TileOverlay.tmpU[1], _TileOverlay.tmpU[3], _TileOverlay.tmpV[0], _TileOverlay.tmpV[1], _TileOverlay.tmpV[3]}, textureId);
+                    glTextureTriangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, (UV){_TileOverlay.tmpU[0], _TileOverlay.tmpU[1], _TileOverlay.tmpU[3], _TileOverlay.tmpV[0], _TileOverlay.tmpV[1], _TileOverlay.tmpV[3]}, textureId);
                 } else {
-                    gl_gouraud_triangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, 0xff);
+                    glGouraudTriangle(xa, xb, xc, ya, yb, yc, za, zb, zc, colorA, colorB, colorC, 0xff);
                 }
             }
         }
     }
+#if BA_R10_CACHE
+    if(_Custom.use_opengl11 && !r10_hit){r10_emit_time(ba_timing_now()-r10_emit_at);r10_surface_end();}
+#endif
+#endif
+#ifdef GL11
+    if (!draw_cpu_tile) return;
 #endif
     _Pix3D.alpha = 0;
 
-    for (int v = 0; v < overlay->triangleCount; v++) {
+    vertexCount = overlay->triangleCount;
+    for (int v = 0; v < vertexCount; v++) {
         int a = overlay->triangleVertexA[v];
         int b = overlay->triangleVertexB[v];
         int c = overlay->triangleVertexC[v];
@@ -2143,15 +2317,15 @@ void world3d_update_activeoccluders(void) {
         int deltaMaxTileZ;
         int deltaMaxTileX;
         if (occluder->type == 1) {
-            deltaMaxY = occluder->minTileX + 25 - _World3D.eyeTileX;
-            if (deltaMaxY >= 0 && deltaMaxY <= 50) {
-                deltaMinTileZ = occluder->minTileZ + 25 - _World3D.eyeTileZ;
+            deltaMaxY = occluder->minTileX + WORLD_VIS_RADIUS - _World3D.eyeTileX;
+            if (deltaMaxY >= 0 && deltaMaxY <= (WORLD_VIS_SIZE-1)) {
+                deltaMinTileZ = occluder->minTileZ + WORLD_VIS_RADIUS - _World3D.eyeTileZ;
                 if (deltaMinTileZ < 0) {
                     deltaMinTileZ = 0;
                 }
-                deltaMaxTileZ = occluder->maxTileZ + 25 - _World3D.eyeTileZ;
-                if (deltaMaxTileZ > 50) {
-                    deltaMaxTileZ = 50;
+                deltaMaxTileZ = occluder->maxTileZ + WORLD_VIS_RADIUS - _World3D.eyeTileZ;
+                if (deltaMaxTileZ > (WORLD_VIS_SIZE-1)) {
+                    deltaMaxTileZ = (WORLD_VIS_SIZE-1);
                 }
                 bool ok = false;
                 while (deltaMinTileZ <= deltaMaxTileZ) {
@@ -2179,15 +2353,15 @@ void world3d_update_activeoccluders(void) {
                 }
             }
         } else if (occluder->type == 2) {
-            deltaMaxY = occluder->minTileZ + 25 - _World3D.eyeTileZ;
-            if (deltaMaxY >= 0 && deltaMaxY <= 50) {
-                deltaMinTileZ = occluder->minTileX + 25 - _World3D.eyeTileX;
+            deltaMaxY = occluder->minTileZ + WORLD_VIS_RADIUS - _World3D.eyeTileZ;
+            if (deltaMaxY >= 0 && deltaMaxY <= (WORLD_VIS_SIZE-1)) {
+                deltaMinTileZ = occluder->minTileX + WORLD_VIS_RADIUS - _World3D.eyeTileX;
                 if (deltaMinTileZ < 0) {
                     deltaMinTileZ = 0;
                 }
-                deltaMaxTileZ = occluder->maxTileX + 25 - _World3D.eyeTileX;
-                if (deltaMaxTileZ > 50) {
-                    deltaMaxTileZ = 50;
+                deltaMaxTileZ = occluder->maxTileX + WORLD_VIS_RADIUS - _World3D.eyeTileX;
+                if (deltaMaxTileZ > (WORLD_VIS_SIZE-1)) {
+                    deltaMaxTileZ = (WORLD_VIS_SIZE-1);
                 }
                 bool ok = false;
                 while (deltaMinTileZ <= deltaMaxTileZ) {
@@ -2217,22 +2391,22 @@ void world3d_update_activeoccluders(void) {
         } else if (occluder->type == 4) {
             deltaMaxY = occluder->minY - _World3D.eyeY;
             if (deltaMaxY > 128) {
-                deltaMinTileZ = occluder->minTileZ + 25 - _World3D.eyeTileZ;
+                deltaMinTileZ = occluder->minTileZ + WORLD_VIS_RADIUS - _World3D.eyeTileZ;
                 if (deltaMinTileZ < 0) {
                     deltaMinTileZ = 0;
                 }
-                deltaMaxTileZ = occluder->maxTileZ + 25 - _World3D.eyeTileZ;
-                if (deltaMaxTileZ > 50) {
-                    deltaMaxTileZ = 50;
+                deltaMaxTileZ = occluder->maxTileZ + WORLD_VIS_RADIUS - _World3D.eyeTileZ;
+                if (deltaMaxTileZ > (WORLD_VIS_SIZE-1)) {
+                    deltaMaxTileZ = (WORLD_VIS_SIZE-1);
                 }
                 if (deltaMinTileZ <= deltaMaxTileZ) {
-                    int deltaMinTileX = occluder->minTileX + 25 - _World3D.eyeTileX;
+                    int deltaMinTileX = occluder->minTileX + WORLD_VIS_RADIUS - _World3D.eyeTileX;
                     if (deltaMinTileX < 0) {
                         deltaMinTileX = 0;
                     }
-                    deltaMaxTileX = occluder->maxTileX + 25 - _World3D.eyeTileX;
-                    if (deltaMaxTileX > 50) {
-                        deltaMaxTileX = 50;
+                    deltaMaxTileX = occluder->maxTileX + WORLD_VIS_RADIUS - _World3D.eyeTileX;
+                    if (deltaMaxTileX > (WORLD_VIS_SIZE-1)) {
+                        deltaMaxTileX = (WORLD_VIS_SIZE-1);
                     }
                     bool ok = false;
                     for (int x = deltaMinTileX; x <= deltaMaxTileX; x++) {

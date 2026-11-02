@@ -51,10 +51,12 @@ void pix2d_set_clipping(int bottom, int right, int top, int left) {
 void pix2d_clear(void) {
     int length = _Pix2D.width * _Pix2D.height;
     int clear_byte = 0;
+#ifdef GL11
     extern Custom _Custom;
     if (_Custom.use_opengl11) {
         clear_byte = 0xff;
     }
+#endif
     memset(_Pix2D.pixels, clear_byte, length * sizeof(int));
 }
 
@@ -84,6 +86,11 @@ void pix2d_fill_rect(int x, int y, int rgb, int w, int h) {
 }
 
 void pix2d_draw_rect(int x, int y, int rgb, int w, int h) {
+#if defined(__vita__) && defined(BUILD_A_EMBEDDED)
+    extern void ui474_note_rect(const int *pixels);
+    ui474_note_rect(_Pix2D.pixels);
+#endif
+
     pix2d_hline(x, y, rgb, w);
     pix2d_hline(x, y + h - 1, rgb, w);
     pix2d_vline(x, y, rgb, h);
@@ -108,7 +115,7 @@ void pix2d_fill_circle(int x_center, int y_center, int y_radius, int rgb, int al
 
 	for (int y = y_start; y <= y_end; y++) {
 		int midpoint = y - y_center;
-		int x_radius = (int) SQRT((y_radius * y_radius) - (midpoint * midpoint));
+		int x_radius = (int) sqrt((y_radius * y_radius) - (midpoint * midpoint));
 		int x_start = x_center - x_radius;
 		if (x_start < 0) {
 			x_start = 0;

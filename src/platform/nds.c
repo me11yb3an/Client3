@@ -9,51 +9,300 @@
 #include <nds.h>
 #include <wfc.h>
 
-#include "../client.h"
 #include "../gameshell.h"
 #include "../pixmap.h"
 #include "../platform.h"
 #include "../defines.h"
-#include "../inputtracking.h"
 
-extern InputTracking _InputTracking;
-
-// static int screen_offset_x = (SCREEN_FB_WIDTH - SCREEN_WIDTH) / 2;
-// static int screen_offset_y = -200;
-// static int screen_offset_x = -8;
-// static int screen_offset_y = -11;
-static int screen_offset_x = 0;
-static int screen_offset_y = 0;
-
-static touchPosition touch;
+static int screen_offset_x = (SCREEN_FB_WIDTH - SCREEN_WIDTH) / 2;
+static int screen_offset_y = -100;
 
 static uint16_t *fb = (uint16_t *)VRAM_A;
 
+static const char *const signalStrength[] = {
+    //---------------------------------------------------------------------------------
+    "[   ]",
+    "[.  ]",
+    "[.i ]",
+    "[.iI]",
+};
+
+//---------------------------------------------------------------------------------
+static const char *const authTypes[] = {
+    //---------------------------------------------------------------------------------
+    "Open",
+    "WEP",
+    "WEP",
+    "WEP",
+    "WPA-PSK-TKIP",
+    "WPA-PSK-AES",
+    "WPA2-PSK-TKIP",
+    "WPA2-PSK-AES",
+};
+
+static const char *const connStatus[] = {
+    //---------------------------------------------------------------------------------
+    "Disconnected :(",
+    "Searching...",
+    "Associating...",
+    "Obtaining IP address...",
+    "Connected!",
+};
+
+static void keyPressed(int c) {
+    //---------------------------------------------------------------------------------
+    if (c > 0)
+        rs2_log("%c", c);
+}
+
+static inline WlanBssAuthType authMaskToType(unsigned mask) {
+    //---------------------------------------------------------------------------------
+    return mask ? (WlanBssAuthType)(31 - __builtin_clz(mask)) : WlanBssAuthType_Open;
+}
+
+static WlanBssDesc *findAP(void) {
+    //---------------------------------------------------------------------------------
+    int selected = 0;
+    int i;
+    int displaytop = 0;
+    unsigned count = 0;
+    WlanBssDesc *aplist = NULL;
+    WlanBssDesc *apselected = NULL;
+
+    static const WlanBssScanFilter filter = {
+        .channel_mask = UINT32_MAX,
+        .target_bssid = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+    };
+
+_rescan:
+    if (!wfcBeginScan(&filter)) {
+        return NULL;
+    }
+
+    rs2_log("Scanning APs...\n");
+
+    while (pmMainLoop() && !(aplist = wfcGetScanBssList(&count))) {
+        swiWaitForVBlank();
+        scanKeys();
+
+        if (keysDown() & KEY_START)
+            exit(0);
+    }
+
+    if (!aplist || !count) {
+        rs2_log("No APs detected\n");
+        return NULL;
+    }
+
+    while (pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+
+        u32 pressed = keysDown();
+        if (pressed & KEY_START)
+            exit(0);
+        if (pressed & KEY_A) {
+            apselected = &aplist[selected];
+            break;
+        }
+
+        consoleClear();
+
+        if (pressed & KEY_R) {
+            goto _rescan;
+        }
+
+        rs2_log("%u APs detected (R = rescan)\n\n", count);
+
+        int displayend = displaytop + 10;
+        if (displayend > count)
+            displayend = count;
+
+        // display the APs to the user
+        for (i = displaytop; i < displayend; i++) {
+            WlanBssDesc *ap = &aplist[i];
+
+            // display the name of the AP
+            rs2_log("%s%.29s\n  %s Type:%s\n",
+                    i == selected ? "*" : " ",
+                    ap->ssid_len ? ap->ssid : "-- Hidden SSID --",
+                    signalStrength[wlanCalcSignalStrength(ap->rssi)],
+                    authTypes[authMaskToType(ap->auth_mask)]);
+        }
+
+        // move the selection asterisk
+        if (pressed & KEY_UP) {
+            selected--;
+            if (selected < 0) {
+                selected = 0;
+            }
+
+            if (selected < displaytop) {
+                displaytop = selected;
+            }
+        }
+
+        if (pressed & KEY_DOWN) {
+            selected++;
+            if (selected >= count) {
+                selected = count - 1;
+            }
+
+            displaytop = selected - 9;
+            if (displaytop < 0) {
+                displaytop = 0;
+            }
+        }
+    }
+
+    return apselected;
+}
+
 bool platform_init(void) {
-    cpuStartTiming(0xdeadbeef); // NOTE unused value, but not in blocksds?
-    lcdMainOnBottom();
     consoleDemoInit();
-    // consoleDebugInit(DebugDevice_NOCASH); // has to be disabled on hw for logging errors, need to detect if running in emu?
     videoSetMode(MODE_FB0);
     vramSetBankA(VRAM_A_LCD);
-    memset(fb, 0, SCREEN_FB_WIDTH * SCREEN_FB_HEIGHT * sizeof(uint16_t)); // clear garbage on fb
-
     if (!isDSiMode()) {
-        rs2_error("NDS detected! only DSi is supported.\n");
+        rs2_error("Unsupported: NDS detected!\n\nThis requires 3DS DSI emulation\n\n");
         return false;
     }
     if (!nitroFSInit(NULL)) {
-        rs2_error("nitroFS init failed\n");
+        rs2_error("Nitro init failed\n");
         return false;
     }
     chdir("nitro:/");
 
-    // TODO move to clientstream_init? and maybe allow retries?
-    if (!Wifi_InitDefault(WFC_CONNECT)) {
-        rs2_error("Failed to connect!\n");
+    TIMER0_CR = TIMER_ENABLE | TIMER_DIV_1024;
+    // TIMER1_CR = TIMER_ENABLE | TIMER_CASCADE;
+
+    Keyboard *kb = keyboardDemoInit();
+    kb->OnKeyPressed = keyPressed;
+
+    // TODO move to clientstream_init?
+    if (!Wifi_InitDefault(false)) {
+        rs2_error("Wifi init fail\n");
+        return false;
+    }
+    // TODO melonds dsi uses firmware wifi settings so we can't connect to melon ap directly
+    // if (!Wifi_InitDefault(WFC_CONNECT)) {
+    //     rs2_error("Failed to connect!\n");
+    //     return false;
+    // } else {
+    //     rs2_log("Connected!\n");
+    // }
+
+    char instr[64];
+    unsigned inlen;
+
+    // Auth data must be in main RAM, not DTCM stack
+    static WlanAuthData auth;
+
+    consoleClear();
+    consoleSetWindow(NULL, 0, 0, 32, 24);
+
+    WlanBssDesc *ap = findAP();
+    if (!ap) {
+        rs2_error("No AP found!\n");
         return false;
     }
 
+    consoleClear();
+    consoleSetWindow(NULL, 0, 0, 32, 10);
+
+    if (!ap->ssid_len) {
+        rs2_log("Enter hidden SSID name\n");
+        bool ok;
+        do {
+            if (!fgets(instr, sizeof(instr), stdin)) {
+                exit(0);
+            }
+
+            instr[strcspn(instr, "\n")] = 0;
+            inlen = strlen(instr);
+
+            ok = inlen && inlen <= WLAN_MAX_SSID_LEN;
+            if (!ok) {
+                rs2_error("Invalid SSID\n");
+            }
+        } while (!ok);
+
+        memcpy(ap->ssid, instr, inlen);
+        ap->ssid_len = inlen;
+    }
+
+    rs2_log("Connecting to %.*s\n", ap->ssid_len, ap->ssid);
+    ap->auth_type = authMaskToType(ap->auth_mask);
+    memset(&auth, 0, sizeof(auth));
+
+    if (ap->auth_type != WlanBssAuthType_Open) {
+        rs2_log("Enter %s key\n", authTypes[ap->auth_type]);
+        bool ok;
+        do {
+            if (!fgets(instr, sizeof(instr), stdin)) {
+                exit(0);
+            }
+
+            instr[strcspn(instr, "\n")] = 0;
+            inlen = strlen(instr);
+
+            ok = true;
+            if (ap->auth_type < WlanBssAuthType_WPA_PSK_TKIP) {
+                if (inlen == WLAN_WEP_40_LEN) {
+                    ap->auth_type = WlanBssAuthType_WEP_40;
+                } else if (inlen == WLAN_WEP_104_LEN) {
+                    ap->auth_type = WlanBssAuthType_WEP_104;
+                } else if (inlen == WLAN_WEP_128_LEN) {
+                    ap->auth_type = WlanBssAuthType_WEP_128;
+                } else {
+                    ok = false;
+                }
+            } else if (inlen < 1 || inlen >= WLAN_WPA_PSK_LEN) {
+                ok = false;
+            }
+
+            if (!ok) {
+                rs2_error("Invalid key!\n");
+            }
+        } while (!ok);
+
+        if (ap->auth_type < WlanBssAuthType_WPA_PSK_TKIP) {
+            memcpy(auth.wep_key, instr, inlen);
+        } else {
+            rs2_log("Deriving PMK, please wait\n");
+            wfcDeriveWpaKey(&auth, ap->ssid, ap->ssid_len, instr, inlen);
+        }
+    }
+
+    if (!wfcBeginConnect(ap, &auth)) {
+        rs2_error("wfcBeginConnect(): failed!");
+        return false;
+    }
+
+    bool is_connect = false;
+    while (pmMainLoop()) {
+        swiWaitForVBlank();
+        scanKeys();
+
+        if (keysDown() & KEY_START)
+            exit(0);
+
+        int status = Wifi_AssocStatus();
+
+        consoleClear();
+        rs2_log("%s\n", connStatus[status]);
+
+        is_connect = status == ASSOCSTATUS_ASSOCIATED;
+        if (is_connect || status == ASSOCSTATUS_DISCONNECTED)
+            break;
+    }
+
+    if (is_connect) {
+        unsigned ip = Wifi_GetIP();
+        rs2_log("Our IP: %u.%u.%u.%u\n", ip & 0xff, (ip >> 8) & 0xff, (ip >> 16) & 0xff, (ip >> 24) & 0xff);
+    }
+
+    consoleDemoInit();
+    lcdMainOnBottom();
     return true;
 }
 void platform_new(GameShell *shell) {
@@ -75,79 +324,13 @@ void platform_set_midi(const char *name, int crc, int len) {
 void platform_stop_midi(void) {
 }
 void platform_poll_events(Client *c) {
-    touchPosition last = touch;
-    touchRead(&touch);
-
-    scanKeys();
-    int pressed = keysDown();
-    int released = keysUp();
-
-    // TODO right press/release
-    if (pressed & KEY_TOUCH) {
-        int x = touch.px - screen_offset_x;
-        int y = touch.py - screen_offset_y;
-
-        // moved
-        if (touch.px != last.px || touch.py != last.py) {
-            c->shell->idle_cycles = 0;
-            c->shell->mouse_x = x;
-            c->shell->mouse_y = y;
-
-            if (_InputTracking.enabled) {
-                inputtracking_mouse_moved(&_InputTracking, x, y);
-            }
-        }
-
-        c->shell->mouse_click_x = x;
-        c->shell->mouse_click_y = y;
-
-        // if (e.button.button == SDL_BUTTON_RIGHT) {
-        //     c->shell->mouse_click_button = 2;
-        //     c->shell->mouse_button = 2;
-        // } else {
-            c->shell->mouse_click_button = 1;
-            c->shell->mouse_button = 1;
-        // }
-
-        if (_InputTracking.enabled) {
-            // inputtracking_mouse_pressed(&_InputTracking, x, y, e.button.button == SDL_BUTTON_RIGHT ? 1 : 0);
-        }
-    }
-
-    if (released & KEY_TOUCH) {
-        c->shell->idle_cycles = 0;
-        c->shell->mouse_button = 0;
-
-        if (_InputTracking.enabled) {
-            // inputtracking_mouse_released(&_InputTracking, (e.button.button & SDL_BUTTON_RMASK) != 0 ? 1 : 0);
-        }
-    }
-
-    if (pressed & KEY_UP) {
-        key_pressed(c->shell, K_UP, -1);
-    }
-    if (pressed & KEY_DOWN) {
-        key_pressed(c->shell, K_DOWN, -1);
-    }
-    if (pressed & KEY_LEFT) {
-        key_pressed(c->shell, K_LEFT, -1);
-    }
-    if (pressed & KEY_RIGHT) {
-        key_pressed(c->shell, K_RIGHT, -1);
-    }
-
-    if (released & KEY_UP) {
-        key_released(c->shell, K_UP, -1);
-    }
-    if (released & KEY_DOWN) {
-        key_released(c->shell, K_DOWN, -1);
-    }
-    if (released & KEY_LEFT) {
-        key_released(c->shell, K_LEFT, -1);
-    }
-    if (released & KEY_RIGHT) {
-        key_released(c->shell, K_RIGHT, -1);
-    }
+    // while (pmMainLoop()) {
+    //     swiWaitForVBlank();
+    //     scanKeys();
+    //     int pressed = keysDown();
+    //     if (pressed & KEY_START)
+    //         break;
+    // }
 }
 void platform_blit_surface(Surface *surface, int x, int y) {
     for (int row = 0; row < surface->h; row++) {
@@ -174,31 +357,19 @@ void platform_blit_surface(Surface *surface, int x, int y) {
 }
 void platform_update_surface(void) {
 }
-
-static inline u32 timerTicks2msec64(u64 ticks) {
-	return ticks*1000/BUS_CLOCK;
-}
-
+// TODO: timers are untested
+#define timers2ms(tlow, thigh) (tlow | (thigh << 16)) >> 5
 uint64_t rs2_now(void) {
-#if 1
-    static uint32_t last_ticks;
-    static uint64_t accum_ticks;
-
-    uint32_t now = cpuGetTiming();
-    uint32_t delta = now - last_ticks;
-    last_ticks = now;
-
-    accum_ticks += delta;
-
-    return timerTicks2msec64(accum_ticks);
-#else
-    return timerTicks2msec(cpuGetTiming()); // NOTE this only lasts 128 seconds until overflow (u32 max / ticks per sec)
-#endif
+    return timers2ms(TIMER0_DATA, TIMER1_DATA);
 }
 void rs2_sleep(int ms) {
-    // TODO: swiIntrWait with timers would be preferred to not busy wait
-    uint64_t end = rs2_now() + ms;
-    while (rs2_now() != end)
+    uint32_t now;
+    now = timers2ms(TIMER0_DATA, TIMER1_DATA);
+    while ((uint32_t)timers2ms(TIMER0_DATA, TIMER1_DATA) < now + ms)
         ;
+    /* uint64_t end = rs2_now() + ms;
+
+    while (rs2_now() != end)
+        ; */
 }
 #endif

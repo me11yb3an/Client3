@@ -165,11 +165,11 @@ Pix24 *objtype_get_icon_outline(int id, int count, int outline_color) {
     int zoom2d = obj->zoom2d;
 
     if (outline_color == -1) {
-        zoom2d = (int)((DOUBLE)zoom2d * 1.5);
+        zoom2d = (int)((double)zoom2d * 1.5);
     }
 
     if (outline_color > 0) {
-        zoom2d = (int)((DOUBLE)zoom2d * 1.04);
+        zoom2d = (int)((double)zoom2d * 1.04);
     }
 
     int sinPitch = _Pix3D.sin_table[obj->xan2d] * zoom2d >> 16;
@@ -577,7 +577,7 @@ Model *objtype_get_interfacemodel(ObjType *obj, int count, bool use_allocator) {
     }
 
     model_calculate_normals(model, 64, 768, -50, -10, -50, true, use_allocator);
-    model->pick_aabb = true;
+    model->pickable = true;
     lrucache_put(_ObjType.modelCache, obj->index, &model->link);
     return model;
 }

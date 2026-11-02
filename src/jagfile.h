@@ -18,3 +18,6 @@ Jagfile *jagfile_new(int8_t *src, int length);
 void jagfile_free(Jagfile *jagfile);
 Packet *jagfile_to_packet(Jagfile *jagfile, const char *name);
 uint8_t *jagfile_to_bytes(Jagfile *jagfile, const char* name, int *length);
+
+// Non-mutating lookup for optional compatibility members.
+bool jagfile_has_file(Jagfile *jagfile, const char *name);

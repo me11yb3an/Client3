@@ -35,8 +35,14 @@ PathingEntity pathingentity_new(const char *type) {
     return entity;
 }
 
+
+// Original474 actor methods495/499 use opcode10 independently of animation priority.
+static bool pathingentity_interrupts_on_move(const SeqType *seq) {
+    if (seq->compatibilityMetadata && seq->priorityWalking >= 0) return seq->priorityWalking == 1;
+    return seq->priority <= 1;
+}
 void pathingentity_teleport(PathingEntity *entity, bool jump, int x, int z) {
-    if (entity->primarySeqId != -1 && _SeqType.instances[entity->primarySeqId]->priority <= 1) {
+    if (entity->primarySeqId != -1 && pathingentity_interrupts_on_move(_SeqType.instances[entity->primarySeqId])) {
         entity->primarySeqId = -1;
     }
 
@@ -96,7 +102,7 @@ void pathingentity_movealongroute(PathingEntity *entity, bool running, int direc
         nextZ--;
     }
 
-    if (entity->primarySeqId != -1 && _SeqType.instances[entity->primarySeqId]->priority <= 1) {
+    if (entity->primarySeqId != -1 && pathingentity_interrupts_on_move(_SeqType.instances[entity->primarySeqId])) {
         entity->primarySeqId = -1;
     }
 

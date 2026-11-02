@@ -8,71 +8,18 @@ typedef struct {
     float vA, vB, vC;
 } UV;
 
+UV pmn_to_uv(int xA, int yA, int zA, int xB, int yB, int zB, int xC, int yC, int zC, int xP, int yP, int zP, int xM, int yM, int zM, int xN, int yN,  int zN);
 void gl_load(void);
 void gl_start_frame(void);
 void gl_end_frame(void);
 void gl_start_drawscene(void);
 void gl_end_drawscene(Client *c);
+void gl_discard_geometry(void);
 void gl_set_brightness(void);
-void gl_gouraud_triangle(int xA, int xB, int xC, int yA, int yB, int yC, int zA, int zB, int zC, int colorA, int colorB, int colorC, int alpha);
-void gl_texture_triangle(int xA, int xB, int xC, int yA, int yB, int yC, int zA, int zB, int zC, int shadeA, int shadeB, int shadeC, UV uv, int texture);
+uint32_t gl_paving_texture(void);
+void glGouraudTriangle(int xA, int xB, int xC, int yA, int yB, int yC, int zA, int zB, int zC, int colorA, int colorB, int colorC, int alpha);
+void glTextureTriangle(int xA, int xB, int xC, int yA, int yB, int yC, int zA, int zB, int zC, int shadeA, int shadeB, int shadeC, UV uv, int texture);
 void gl_start_model(Model *model, int sceneX, int sceneY, int sceneZ, int yaw);
-
-static inline int next_po2(int v) {
-    int p = 1;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-// source:
-// https://rune-server.org/threads/texture-mapping-conversions-pmn-uv-pmn.701381/
-// https://rune-server.org/threads/better-texture-mapping-conversions.706373/
-
-static inline UV pmn_to_uv(int xA, int yA, int zA, int xB, int yB, int zB, int xC, int yC, int zC, int xP, int yP, int zP, int xM, int yM, int zM, int xN, int yN, int zN) {
-    float mX = xM - xP;
-    float mY = yM - yP;
-    float mZ = zM - zP;
-
-    float nX = xN - xP;
-    float nY = yN - yP;
-    float nZ = zN - zP;
-
-    float aX = xA - xP;
-    float aY = yA - yP;
-    float aZ = zA - zP;
-
-    float bX = xB - xP;
-    float bY = yB - yP;
-    float bZ = zB - zP;
-
-    float cX = xC - xP;
-    float cY = yC - yP;
-    float cZ = zC - zP;
-
-    float MxNx = mY * nZ - mZ * nY;
-    float MxNy = mZ * nX - mX * nZ;
-    float MxNz = mX * nY - mY * nX;
-
-    float uX = nY * MxNz - nZ * MxNy;
-    float uY = nZ * MxNx - nX * MxNz;
-    float uZ = nX * MxNy - nY * MxNx;
-
-    float mU = 1.0f / (uX * mX + uY * mY + uZ * mZ);
-    float uA = (uX * aX + uY * aY + uZ * aZ) * mU;
-    float uB = (uX * bX + uY * bY + uZ * bZ) * mU;
-    float uC = (uX * cX + uY * cY + uZ * cZ) * mU;
-
-    float vX = mY * MxNz - mZ * MxNy;
-    float vY = mZ * MxNx - mX * MxNz;
-    float vZ = mX * MxNy - mY * MxNx;
-
-    float mV = 1.0f / (vX * nX + vY * nY + vZ * nZ);
-    float vA = (vX * aX + vY * aY + vZ * aZ) * mV;
-    float vB = (vX * bX + vY * bY + vZ * bZ) * mV;
-    float vC = (vX * cX + vY * cY + vZ * cZ) * mV;
-
-    return (UV){uA, uB, uC, vA, vB, vC};
-}
 
 #ifdef GL11
 #if !defined(__vita__) && SDL != 1
@@ -80,14 +27,15 @@ static inline UV pmn_to_uv(int xA, int yA, int zA, int xB, int yB, int zB, int x
 #endif
 
 typedef struct {
-    uint8_t r, g, b, a;
-    int16_t x, y, z;
+    unsigned char r, g, b, a;
+    float x, y, z;
     float u, v;
 } Vertex;
 
-extern Vertex verts[300000];
+extern Vertex *verts;
+void gl_reserve_geometry(unsigned vertices,unsigned elements);
 extern int vertcount;
-extern uint32_t indices[100000];
+extern uint32_t *indices;
 extern int elementcount;
 
 #ifdef _WIN32
@@ -97,8 +45,6 @@ extern int elementcount;
 #ifdef __vita__
 #include <vitaGL.h>
 #define GL_BGRA_EXT GL_BGRA
-#elif defined(__APPLE__)
-#include <OpenGL/gl.h>
 #elif !(defined(__TINYC__) && defined(_WIN32))
 #include <GL/gl.h>
 #else // c&p windows gl.h for tcc
@@ -1581,3 +1527,9 @@ typedef void (APIENTRY * PFNGLGETCOLORTABLEPARAMETERFVEXTPROC)
     (GLenum target, GLenum pname, GLfloat *params);
 #endif
 #endif
+
+void gl_actor_cache_frame(void);
+void gl_actor_span_begin(void);
+int gl_actor_span_end(void);
+void gl_actor_cache_reset(void);
+void gl_actor_cache_status(unsigned out[5]);

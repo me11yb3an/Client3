@@ -96,3 +96,15 @@
 /config.ini
 /**/*.rdi
 .DS_Store
+
+# Local packages, saves, and secrets. Upstream rom/ stays tracked.
+*.pak
+*.suprx
+*.sav
+*.sav.bak
+*.sav.tmp
+/players/
+/ux0/
+.env
+.env.*
+credentials.json

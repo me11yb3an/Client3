@@ -1,0 +1,34 @@
+#pragma once
+static int r54_crate_type(int id){switch(id){
+case 0:
+case 1:
+case 63:
+case 64:
+case 67:
+case 354:
+case 355:
+case 356:
+case 357:
+case 358:
+case 366:
+case 1990:
+case 1999:
+case 2064:
+case 2071:
+case 2072:
+case 2364:
+case 2365:
+case 2519:
+case 2620:
+case 2707:
+case 2708:
+case 2858:
+case 2905:
+case 3195:
+case 3360:
+case 3426:
+case 3427:
+case 3661:
+case 3662:
+case 3663:
+return 1;default:return 0;}}

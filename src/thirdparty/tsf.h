@@ -1611,9 +1611,10 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 			{
 				// Allocate more voices so we don't need to kill one off.
 				struct tsf_voice* newVoices;
-				f->voiceNum += 4;
-				newVoices = (struct tsf_voice*)TSF_REALLOC(f->voices, f->voiceNum * sizeof(struct tsf_voice));
+				int newVoiceNum = f->voiceNum + 4;
+				newVoices = (struct tsf_voice*)TSF_REALLOC(f->voices, newVoiceNum * sizeof(struct tsf_voice));
 				if (!newVoices) return 0;
+				f->voiceNum = newVoiceNum;
 				f->voices = newVoices;
 				voice = &f->voices[f->voiceNum - 4];
 				voice[1].playingPreset = voice[2].playingPreset = voice[3].playingPreset = -1;

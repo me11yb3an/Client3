@@ -67,6 +67,7 @@ typedef struct {
     int offsetz;
     int forceapproach;
     bool forcedecor;
+    int raiseobject; // -1 retains Build 225 blockwalk-derived elevation.
 
     // custom
     int shapes_and_models_count;
@@ -89,3 +90,7 @@ void loctype_free_global(void);
 LocType *loctype_get(int id);
 void loctype_reset(LocType *loc);
 Model *loctype_get_model(LocType *loc, int shape, int rotation, int heightmapSW, int heightmapSE, int heightmapNE, int heightmapNW, int transformId);
+
+void loctype_set_scene_origin(int x,int z);
+LocType *loctype_visual_for_scene(LocType *loc,int level,int x,int z,int shape,int rotation);
+bool loctype_visual_hidden_for_scene(LocType *loc,int level,int x,int z,int shape,int rotation);

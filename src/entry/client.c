@@ -1,8 +1,41 @@
+#include "../r109_map_decode_cache.h"
+static unsigned r108_sound_received[1000],r108_sound_dispatched[1000],r108_sound_blocked;
+#include "../ba_resource.h"
+#include "../r106_scenery_speed.h"
+#include "../r105_barrows_progress.h"
+#include "r10_scene.h"
+#include "../r57_body_layers.h"
+#include "../r94_audio_cost.h"
+#ifdef BUILD_A_EMBEDDED
+ #include "../h8_remote.h"
+#include "embedded_server.h"
+#endif
+#include "../ba_timing.h"
+#include "../r45_path_recovery.h"
+#include "../draw_phases.h"
+#include "../r16_fast.h"
+#include "../r13_capture.h"
+#include "../ba_hw_r3.h"
+#include "../ui_preview.h"
+#include "../ba_timing.h"
+#include "../title_theme.h"
+#include "../vita_enhanced.h"
+#include "../layoutcore.h"
+#include "../layoutcore_draw.h"
+#include "../ui474.h"
+#include "research_ids.h"
+#include "../vita_title.h"
+#include "../vita_title_layout.h"
+#include "../title_preview_sampling.h"
+#include "../vita_dialogue.h"
+#include "../classic_ui.h"
+#include "../vita_wide_layout.h"
 #ifdef client
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_arch_dreamcast) || defined(__NDS__)
 #include <malloc.h>
 #endif
@@ -65,6 +98,24 @@ extern InputTracking _InputTracking;
 extern ModelData _Model;
 extern ObjTypeData _ObjType;
 extern ComponentData _Component;
+
+/* One geometry for draw, picking, drag and retained updates. Enhanced
+ * popups aim at screen centre while staying clear of the stone sidebar.
+ * Minimized chat frees vertical space, so the same assembly sits lower. */
+static int client_modal_offset(Client*c,int id,int enhanced){
+ if(!enhanced)return guide_modal_offset(id,0);
+ if(id<0||id>=_Component.count||!_Component.instances[id])return 0;
+ Component*r=_Component.instances[id];const LcRect*side=&lc_game_geometry(LC_SIDEBAR)->rect;
+ int x=(960-r->width)/2,limit=side->x-r->width;
+ if(x>limit)x=limit;x-=48;if(x<0)x=0;return x-224;
+}
+static int client_modal_y(Client*c,int id,int enhanced){
+ if(!enhanced)return guide_modal_y(id,0);
+ if(id<0||id>=_Component.count||!_Component.instances[id])return 0;
+ int bottom=ve_chat_hidden(c)?520:lc_game_geometry(LC_CHAT)->rect.y;
+ int y=(bottom-_Component.instances[id]->height)/2;return y>0?y:0;
+}
+
 extern IdkTypeData _IdkType;
 extern VarpTypeData _VarpType;
 extern SeqTypeData _SeqType;
@@ -98,7 +149,66 @@ const int LOC_SHAPE_TO_LAYER[23] = {0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
 
 // TODO add more static funcs here
 static void client_draw_interface(Client *c, Component *com, int x, int y, int scrollY);
+static unsigned long long r106_ambient_input,r106_ambient_output,r106_action_input,r106_action_output;
+static void draw2DEntityElements(Client *c);
+static void drawTileHint(Client *c);
+static void draw3DEntityElements(Client *c);
+static void drawTooltip(Client *c);
+static int ve_world_speech_active(Client*c) {
+    if(c->local_player&&c->local_player->pathing_entity.chatTimer>0)return 1;
+    for(int i=0;i<c->npc_count;i++){NpcEntity*n=c->npcs[c->npc_ids[i]];if(n&&n->pathing_entity.chatTimer>0)return 1;}
+    for(int i=0;i<c->player_count;i++){PlayerEntity*p=c->players[c->player_ids[i]];if(p&&p->pathing_entity.chatTimer>0)return 1;}
+    return 0;
+}
+
+static PixMap *ve_effect_pm[MAX_CHATS+12];
+static size_t ve_effect_bytes;
+static unsigned ve_effect_allocations,ve_effect_resizes;
+static PixMap *ve_effect_surface(int slot,int w,int h){
+    if(slot<0||slot>=MAX_CHATS+12)return NULL;
+    if(w<16)w=16;if(w>1024)w=1024;if(h<16)h=16;if(h>96)h=96;
+    PixMap*p=ve_effect_pm[slot];
+    if(p&&(p->width!=w||p->height!=h)){ve_effect_resizes++;ve_effect_bytes-=(size_t)p->width*p->height*12;pixmap_free(p);ve_effect_pm[slot]=p=NULL;}
+    if(!p){size_t bytes=(size_t)w*h*12;if(ve_effect_bytes+bytes>4u*1024u*1024u)return NULL;p=pixmap_new(w,h);if(!p)return NULL;ve_effect_pm[slot]=p;ve_effect_bytes+=bytes;ve_effect_allocations++;}
+    pixmap_bind(p);memset(p->pixels,0xff,(size_t)w*h*4);return p;
+}
+static void ve_effect_finish(PixMap*p,Pix2D saved,int x,int y){pixmap_draw(p,x,y);_Pix2D=saved;}
+static int ve_complex_overlay(Client*c){return _Custom.camera_editor||_Custom.show_debug;}
+
+static void updateWorldLocationState(Client *c);
+static void ve_draw_location_status(Client *c);
+static void ve_draw_barrows_progress(Client *c);
+static int barrows_progress_count(Client*c);
+static int ve_ui_dirty(Client *c);
+static int ve_script_dirty;
+static int ve_anim_advanced;
+static int ve_popup_patch_guard,ve_popup_frame;
+static int ve_input_advanced;
+static int ve_native_markers(void);
+int ba_agility_probe_enabled;
+static void ve_draw_world_markers(Client *c);
+static void ve_ui_probe(Client *c);
+static int ve_overlay_held_frame;
+int ve_overlay_held(void) { return ve_overlay_held_frame; }
+static void ve_note_component(Client *c, int com) {
+    int id = com;
+    for (int guard = 0; id >= 0 && guard < 24; guard++) {
+        Component *p = _Component.instances[id];
+        if (!p) return;
+        if (id == c->viewport_interface_id || id == c->chat_interface_id || id == c->sticky_chat_interface_id) {
+            ve_script_dirty = 1;
+            return;
+        }
+        if (id == c->sidebar_interface_id || (c->selected_tab >= 0 && c->selected_tab < 15 && id == c->tab_interface_id[c->selected_tab])) {
+            c->redraw_sidebar = true;
+            return;
+        }
+        if (p->layer < 0 || p->layer == id) return;
+        id = p->layer;
+    }
+}
 static void client_scenemap_free(Client *c);
+extern void ba_cadence_diagnostic(const char *line);
 static void client_build_scene(Client *c);
 static void client_clear_caches(void);
 static void client_update_orbit_camera(Client *c);
@@ -107,7 +217,7 @@ void client_init_global(void) {
     int acc = 0;
     for (int i = 0; i < 99; i++) {
         int level = i + 1;
-        int delta = (int)((DOUBLE)level + POW(2.0, (DOUBLE)level / 7.0) * 300.0);
+        int delta = (int)((double)level + pow(2.0, (double)level / 7.0) * 300.0);
         acc += delta;
         _Client.levelExperience[i] = acc / 4;
     }
@@ -180,13 +290,13 @@ void client_load(Client *c) {
             // TODO: hardcoded for now add openurl
             c->archive_checksum[0] = 0;
             c->archive_checksum[1] = 784449929;
-            c->archive_checksum[2] = -1494598746;
-            c->archive_checksum[3] = 1614084464;
-            c->archive_checksum[4] = 855958935;
-            c->archive_checksum[5] = -2000991154;
-            c->archive_checksum[6] = -313801935;
+            c->archive_checksum[2] = -152376011;
+            c->archive_checksum[3] = -1907447422;
+            c->archive_checksum[4] = 1870069386;
+            c->archive_checksum[5] = 385830284;
+            c->archive_checksum[6] = -975987241;
             c->archive_checksum[7] = 1570981179;
-            c->archive_checksum[8] = -1532605973;
+            c->archive_checksum[8] = 606476196;
 #endif
         } else {
             Packet *checksums = packet_new(buffer, size); // 36
@@ -235,14 +345,26 @@ void client_load(Client *c) {
     c->image_chatback = pix8_from_archive(media, "chatback", 0);
     c->image_mapback = pix8_from_archive(media, "mapback", 0);
     c->image_backbase1 = pix8_from_archive(media, "backbase1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_pix8(c->image_chatback, CHAT_WIDTH, 96, 24, 0);
+    classic_extend_chat_controls(c->image_backbase1);
+#endif
     c->image_backbase2 = pix8_from_archive(media, "backbase2", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    Pix8 *corner_stone_source = pix8_from_archive(media, "backvmid3", 0);
+    classic_repair_lower_corner(c->image_backbase2, corner_stone_source);
+    pix8_free(corner_stone_source);
+#endif
     c->image_backhmid1 = pix8_from_archive(media, "backhmid1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_tab_backing(c->image_backhmid1, SIDE_TABS_HEIGHT);
+#endif
     for (int i = 0; i < 13; i++) {
         c->image_sideicons[i] = pix8_from_archive(media, "sideicons", i);
     }
     c->image_compass = pix24_from_archive(media, "compass", 0);
 
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 65; i++) {
         if (_Custom.hide_debug_sprite) {
             if (i == 22) {
                 // weird debug sprite along water
@@ -255,7 +377,7 @@ void client_load(Client *c) {
             break;
         }
     }
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 65; i++) {
         c->image_mapfunction[i] = pix24_from_archive(media, "mapfunction", i);
         if (!c->image_mapfunction[i]) {
             break;
@@ -302,26 +424,37 @@ void client_load(Client *c) {
     c->image_redstone2hv = pix8_from_archive(media, "redstone2", 0);
     pix8_flip_horizontally(c->image_redstone2hv);
     pix8_flip_vertically(c->image_redstone2hv);
-
     Pix24 *backleft1 = pix24_from_archive(media, "backleft1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_pix24(backleft1, 8, GAME_VIEW_HEIGHT, 0, 16);
+#endif
     c->area_backleft1 = pixmap_new(backleft1->width, backleft1->height);
     pix24_blit_opaque(backleft1, 0, 0);
     Pix24 *backleft2 = pix24_from_archive(media, "backleft2", 0);
     c->area_backleft2 = pixmap_new(backleft2->width, backleft2->height);
     pix24_blit_opaque(backleft2, 0, 0);
     Pix24 *backright1 = pix24_from_archive(media, "backright1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_pix24(backright1, 60, 166, 0, 16);
+#endif
     c->area_backright1 = pixmap_new(backright1->width, backright1->height);
     pix24_blit_opaque(backright1, 0, 0);
     Pix24 *backright2 = pix24_from_archive(media, "backright2", 0);
     c->area_backright2 = pixmap_new(backright2->width, backright2->height);
     pix24_blit_opaque(backright2, 0, 0);
     Pix24 *backtop1 = pix24_from_archive(media, "backtop1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_pix24(backtop1, UI_RIGHT(561), 11, 64, 0);
+#endif
     c->area_backtop1 = pixmap_new(backtop1->width, backtop1->height);
     pix24_blit_opaque(backtop1, 0, 0);
     Pix24 *backtop2 = pix24_from_archive(media, "backtop2", 0);
     c->area_backtop2 = pixmap_new(backtop2->width, backtop2->height);
     pix24_blit_opaque(backtop2, 0, 0);
     Pix24 *backvmid1 = pix24_from_archive(media, "backvmid1", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_pix24(backvmid1, 41, 154, 0, 16);
+#endif
     c->area_backvmid1 = pixmap_new(backvmid1->width, backvmid1->height);
     pix24_blit_opaque(backvmid1, 0, 0);
     Pix24 *backvmid2 = pix24_from_archive(media, "backvmid2", 0);
@@ -331,6 +464,9 @@ void client_load(Client *c) {
     c->area_backvmid3 = pixmap_new(backvmid3->width, backvmid3->height);
     pix24_blit_opaque(backvmid3, 0, 0);
     Pix24 *backhmid2 = pix24_from_archive(media, "backhmid2", 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+    classic_extend_chat_border(backhmid2, UI_RIGHT(562));
+#endif
     c->area_backhmid2 = pixmap_new(backhmid2->width, backhmid2->height);
     pix24_blit_opaque(backhmid2, 0, 0);
 
@@ -338,7 +474,7 @@ void client_load(Client *c) {
     int rand_g = (int)(jrand() * 21.0) - 10;
     int rand_b = (int)(jrand() * 21.0) - 10;
     int _rand = (int)(jrand() * 41.0) - 20;
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 65; i++) {
         if (c->image_mapfunction[i]) {
             pix24_translate(c->image_mapfunction[i], rand_r + _rand, rand_g + _rand, rand_b + _rand);
         }
@@ -374,6 +510,11 @@ void client_load(Client *c) {
         Packet *sound_dat = jagfile_to_packet(sounds, "sounds.dat");
         wave_unpack(sound_dat);
         packet_free(sound_dat);
+        if (jagfile_has_file(sounds, "ns_pcm.dat")) {
+            Packet *original_pcm = jagfile_to_packet(sounds, "ns_pcm.dat");
+            wave_unpack_pcm(original_pcm);
+            packet_free(original_pcm);
+        }
     }
 
     client_draw_progress(c, "Unpacking interfaces", 92);
@@ -415,11 +556,11 @@ void client_load(Client *c) {
         c->minimap_mask_line_lengths[y - 9] = right - left;
     }
 
-    pix3d_init3d(479, 96);
+    pix3d_init3d(CHAT_WIDTH, 96);
     c->area_chatback_offsets = _Pix3D.line_offset;
     pix3d_init3d(190, 261);
     c->area_sidebar_offsets = _Pix3D.line_offset;
-    pix3d_init3d(512, 334);
+    pix3d_init3d(GAME_VIEW_WIDTH, GAME_VIEW_HEIGHT);
     c->area_viewport_offsets = _Pix3D.line_offset;
 
     int *distance = malloc(9 * sizeof(int));
@@ -430,7 +571,7 @@ void client_load(Client *c) {
         distance[x] = offset * sin >> 16;
     }
 
-    world3d_init(512, 334, 500, 800, distance);
+    world3d_init(GAME_VIEW_WIDTH, GAME_VIEW_HEIGHT, 500, 800, distance);
     free(distance);
     wordfilter_unpack(wordenc);
 
@@ -460,7 +601,7 @@ void client_load(Client *c) {
 // NOTE: we can't grow it so it needs to fit the max usage, left value is shifted to MiB (arbitrary value)
 #if defined(_arch_dreamcast) || defined(__NDS__)
     malloc_stats();
-    if (!bump_allocator_init(1 << 20)) {
+    if (!bump_allocator_init(8 << 20)) {
 #else
     if (!(_Client.lowmem ? bump_allocator_init(16 << 20) : bump_allocator_init(32 << 20))) {
 #endif
@@ -472,8 +613,8 @@ void client_load(Client *c) {
         c->error_loading = true;
     }
 
-// TODO make screen fit in nds res for logins
-#if defined(__NDS__)
+// TODO temp: wait for wiiu and switch touch input fixes, melonds 32mb emulation
+#if defined(__WIIU__) || defined(__SWITCH__) || defined(__NDS__)
     client_login(c, c->username, c->password, false);
 #endif
 
@@ -483,12 +624,37 @@ void client_load(Client *c) {
 #endif
 }
 
+static void ba_interface_trace(const char *operation,int component,const char *text){
+ FILE *log=fopen("ux0:/data/RS2Vita/interface-packets.log","a");
+ if(log){fprintf(log,"%llu|%s|%d|%.120s\n",(unsigned long long)ba_timing_now(),operation,component,text?text:"");fclose(log);}
+}
 void client_load_title_background(Client *c) {
+    vita_title_invalidate();
     int length;
     uint8_t *data = jagfile_to_bytes(c->archive_title, "title.dat", &length);
     Pix24 *title = pix24_from_jpeg(data, length);
     free(data);
 
+#ifdef VITA_NATIVE_WIDESCREEN
+    Pix24 *wide = classic_load_restored_title();
+    c->title_restored=wide!=NULL;
+    if(!wide)wide=classic_wide_title_background(title);
+    PixMap *pieces[9] = {c->image_title0,c->image_title1,c->image_title2,
+        c->image_title3,c->image_title4,c->image_title5,c->image_title6,
+        c->image_title7,c->image_title8};
+    const int origins[9][2] = {
+        {TITLE_FLAME_LEFT_X,TITLE_Y(0)},{TITLE_FLAME_RIGHT_X,TITLE_Y(0)},
+        {TITLE_TOP_X,TITLE_TOP_Y},{TITLE_BOTTOM_X,TITLE_BOTTOM_Y},
+        {TITLE_X(214),TITLE_Y(186)},{TITLE_LEFT_BASE_X,TITLE_Y(265)},
+        {TITLE_X(574),TITLE_Y(265)},{TITLE_LEFT_MID_X,TITLE_Y(186)},
+        {TITLE_X(574),TITLE_Y(186)}
+    };
+    for (int i=0;i<9;i++) {
+        pixmap_bind(pieces[i]);
+        pix24_blit_opaque(wide,-origins[i][0],-origins[i][1]);
+    }
+    if(c->title_restored){c->title_restored_background=wide;c->title_panel_scaled=pixmap_new(360,200);c->title_panel_background=pix24_new(360,200,false);memcpy(c->title_panel_background->pixels,c->image_title4->pixels,360*200*sizeof(int));}else pix24_free(wide);
+#else
     pixmap_bind(c->image_title0);
     pix24_blit_opaque(title, 0, 0);
 
@@ -555,10 +721,11 @@ void client_load_title_background(Client *c) {
     pixmap_bind(c->image_title8);
     pix24_blit_opaque(title, -180, -186);
 
+#endif
     pix24_free(title);
     title = pix24_from_archive(c->archive_title, "logo", 0);
     pixmap_bind(c->image_title2);
-    pix24_draw(title, c->shell->screen_width / 2 - title->width / 2 - 128, 18);
+    if(c->title_restored)classic_draw_title_logo_scaled(title,TITLE_Y(18));else classic_draw_title_logo(title, TITLE_Y(18));
 
     pix24_free(title);
     title = NULL;
@@ -569,7 +736,7 @@ void client_update_flame_buffer(Client *c, Pix8 *image) {
     memset(c->flame_buffer0, 0, FLAME_BUFFER_SIZE * sizeof(int));
 
     for (int i = 0; i < 5000; i++) {
-        int index = (int)(jrand() * 128.0 * (DOUBLE)flame_height);
+        int index = (int)(jrand() * 128.0 * (double)flame_height);
         c->flame_buffer0[index] = (int)(jrand() * 256.0);
     }
 
@@ -620,6 +787,21 @@ void client_load_title_images(Client *c) {
     c->image_flames_right = pix24_new(128, 265, false);
     memcpy(c->image_flames_left->pixels, c->image_title0->pixels, 33920 * sizeof(int));
     memcpy(c->image_flames_right->pixels, c->image_title1->pixels, 33920 * sizeof(int));
+#ifdef VITA_NATIVE_WIDESCREEN
+    if(c->title_restored){
+        c->title_flame_left=pixmap_new(200,265);c->title_flame_right=pixmap_new(200,265);
+        c->title_flame_clip_left=pixmap_new(200,217);c->title_flame_clip_right=pixmap_new(200,217);
+        pix24_free(c->image_flames_left);pix24_free(c->image_flames_right);
+        c->image_flames_left=pix24_new(200,265,false);c->image_flames_right=pix24_new(200,265,false);
+        const int origin[2]={54,710};Pix24*bg[2]={c->image_flames_left,c->image_flames_right};
+        for(int side=0;side<2;side++)for(int y=0;y<265;y++)for(int x=0;x<200;x++){
+            int screenY=y-48;if(screenY<0)screenY=0;
+            bg[side]->pixels[y*200+x]=c->title_restored_background->pixels[screenY*960+origin[side]+x];
+        }
+        pix24_free(c->title_restored_background);c->title_restored_background=NULL;
+    }
+#endif
+
     c->flame_gradient0 = calloc(256, sizeof(int));
     for (int i = 0; i < 64; i++) {
         c->flame_gradient0[i] = i * 262144;
@@ -673,6 +855,7 @@ void client_load_title_images(Client *c) {
 }
 
 static void client_update_flames(Client *c) {
+    ba_timing_record(BA_FLAME_STEP,0);
     int height = 256;
     for (int x = 10; x < 117; x++) {
         int _rand = (int)(jrand() * 100.0);
@@ -717,7 +900,7 @@ static void client_update_flames(Client *c) {
         c->flame_line_offset[y] = c->flame_line_offset[y + 1];
     }
 
-    c->flame_line_offset[height - 1] = (int)(SIN((DOUBLE)_Client.loop_cycle / 14.0) * 16.0 + SIN((DOUBLE)_Client.loop_cycle / 15.0) * 14.0 + SIN((DOUBLE)_Client.loop_cycle / 16.0) * 12.0);
+    c->flame_line_offset[height - 1] = (int)(sin((double)_Client.loop_cycle / 14.0) * 16.0 + sin((double)_Client.loop_cycle / 15.0) * 14.0 + sin((double)_Client.loop_cycle / 16.0) * 12.0);
 
     if (c->flameGradientCycle0 > 0) {
         c->flameGradientCycle0 -= 4;
@@ -743,8 +926,34 @@ static int mix(int src, int alpha, int dst) {
     return (((src & 0xff00ff) * invAlpha + (dst & 0xff00ff) * alpha & 0xff00ff00) + ((src & 0xff00) * invAlpha + (dst & 0xff00) * alpha & 0xff0000)) >> 8;
 }
 
+// Approved restoration: full original intensity field, no transparency mask.
+// Widen only the reusable title-local tiles; simulation/palette/timing unchanged.
+static void client_draw_restored_flames(Client*c){
+ PixMap*targets[2]={c->title_flame_left,c->title_flame_right};Pix24*background[2]={c->image_flames_left,c->image_flames_right};
+ for(int side=0;side<2;side++){
+  memcpy(targets[side]->pixels,background[side]->pixels,200*265*sizeof(int));
+  // Approved B: nearest-neighbor 90% transparent field, centered/bottom anchored.
+  for(int dy=0;dy<195;dy++){
+   int sy=title_flame_y[dy]+39;if(sy>=254)continue;
+   int offset=c->flame_line_offset[sy+1]*(255-sy)/256;
+   for(int dx=0;dx<180;dx++){
+    int source_x=title_flame_x[dx],sx=side==0?source_x-36+offset:source_x-35-offset;
+    if(sx<0||sx>=128||sy>=254)continue;
+    int alpha=c->flame_buffer3[sy*128+sx];if(!alpha)continue;
+    int colour=c->flame_gradient[alpha],inverse=256-alpha,at=(dy+70)*200+dx+10,old=targets[side]->pixels[at];
+    targets[side]->pixels[at]=(((colour&0xff00ff)*alpha+(old&0xff00ff)*inverse&0xff00ff00)+((colour&0xff00)*alpha+(old&0xff00)*inverse&0xff0000))>>8;
+   }
+  }
+ }
+ memcpy(c->title_flame_clip_left->pixels,targets[0]->pixels+48*200,200*217*sizeof(int));memcpy(c->title_flame_clip_right->pixels,targets[1]->pixels+48*200,200*217*sizeof(int));
+ c->title_flame_clip_left->dirty=true;c->title_flame_clip_right->dirty=true;
+ pixmap_draw(c->title_flame_clip_left,54,0);pixmap_draw(c->title_flame_clip_right,710,0);
+}
+
 static void client_draw_flames(Client *c) {
     int height = 256;
+    PixMap*left=c->title_restored?c->title_flame_left:c->image_title0;
+    PixMap*right=c->title_restored?c->title_flame_right:c->image_title1;
 
     if (c->flameGradientCycle0 > 0) {
         for (int i = 0; i < 256; i++) {
@@ -769,7 +978,8 @@ static void client_draw_flames(Client *c) {
     } else {
         memcpy(c->flame_gradient, c->flame_gradient0, 256 * sizeof(int));
     }
-    memcpy(c->image_title0->pixels, c->image_flames_left->pixels, 33920 * sizeof(int));
+    if(c->title_restored){client_draw_restored_flames(c);return;}
+    memcpy(left->pixels, c->image_flames_left->pixels, 33920 * sizeof(int));
 
     int srcOffset = 0;
     int dstOffset = 1152;
@@ -789,16 +999,16 @@ static void client_draw_flames(Client *c) {
                 int alpha = value;
                 int invAlpha = 256 - value;
                 value = c->flame_gradient[value];
-                int background = c->image_title0->pixels[dstOffset];
-                c->image_title0->pixels[dstOffset++] = (((value & 0xff00ff) * alpha + (background & 0xff00ff) * invAlpha & 0xff00ff00) + ((value & 0xff00) * alpha + (background & 0xff00) * invAlpha & 0xff0000)) >> 8;
+                int background = left->pixels[dstOffset];
+                left->pixels[dstOffset++] = (((value & 0xff00ff) * alpha + (background & 0xff00ff) * invAlpha & 0xff00ff00) + ((value & 0xff00) * alpha + (background & 0xff00) * invAlpha & 0xff0000)) >> 8;
             }
         }
         dstOffset += step;
     }
 
-    pixmap_draw(c->image_title0, 0, 0);
+    pixmap_draw(left,TITLE_FLAME_LEFT_X,TITLE_Y(0));
 
-    memcpy(c->image_title1->pixels, c->image_flames_right->pixels, 33920 * sizeof(int));
+    memcpy(right->pixels, c->image_flames_right->pixels, 33920 * sizeof(int));
 
     srcOffset = 0;
     dstOffset = 1176;
@@ -814,26 +1024,41 @@ static void client_draw_flames(Client *c) {
                 int alpha = value;
                 int invAlpha = 256 - value;
                 value = c->flame_gradient[value];
-                int background = c->image_title1->pixels[dstOffset];
-                c->image_title1->pixels[dstOffset++] = (((value & 0xff00ff) * alpha + (background & 0xff00ff) * invAlpha & 0xff00ff00) + ((value & 0xff00) * alpha + (background & 0xff00) * invAlpha & 0xff0000)) >> 8;
+                int background = right->pixels[dstOffset];
+                right->pixels[dstOffset++] = (((value & 0xff00ff) * alpha + (background & 0xff00ff) * invAlpha & 0xff00ff00) + ((value & 0xff00) * alpha + (background & 0xff00) * invAlpha & 0xff0000)) >> 8;
             }
         }
         srcOffset += 128 - step;
         dstOffset += 128 - step - offset;
     }
 
-    pixmap_draw(c->image_title1, 661, 0);
+    pixmap_draw(right,TITLE_FLAME_RIGHT_X,TITLE_Y(0));
 }
 
 void client_run_flames(Client *c) {
+    /* The approved native 20 ms loop presents the original paired update every
+       two frames (40 ms). Keep that measured cadence independently of rendering. */
     static uint64_t next = 0;
-    if (!c->flame_active || next >= rs2_now()) {
-        return;
+    static Client*flame_owner;static unsigned flame_generation;static bool flame_frame_ready;
+    uint64_t now=rs2_now();
+    if(!c->flame_active){next=0;flame_frame_ready=false;return;}
+    if(!next || now>next+1000)next=now;
+    bool changed=false;
+    while(now>=next){
+        client_update_flames(c);
+        client_update_flames(c);
+        next+=40;
+        changed=true;
     }
-    client_update_flames(c);
-    client_update_flames(c);
-    client_draw_flames(c);
-    next = rs2_now() + 35; // hardcode interval of 35 to avoid inconsistent rate
+    unsigned generation=vita_title_generation();
+    if(changed||(_Custom.use_opengl11&&(!flame_frame_ready||flame_owner!=c||flame_generation!=generation))){
+        client_draw_flames(c);flame_frame_ready=true;flame_owner=c;flame_generation=generation;
+    }else if(_Custom.use_opengl11){
+        /* GL still redraws the original flame quads on every presentation;
+         * only identical CPU compositing/uploads between40ms updates are held. */
+        if(c->title_restored){pixmap_draw(c->title_flame_clip_left,54,0);pixmap_draw(c->title_flame_clip_right,710,0);}
+        else {pixmap_draw(c->image_title0,TITLE_FLAME_LEFT_X,TITLE_Y(0));pixmap_draw(c->image_title1,TITLE_FLAME_RIGHT_X,TITLE_Y(0));}
+    }
 
     /* NOTE: original
     // try {
@@ -870,7 +1095,102 @@ void client_run_flames(Client *c) {
     */
 }
 
+/* Opt-in native performance harness, absent from distributed VPK data.
+ * Uses the ordinary login protocol and a copied disposable save; no UI input,
+ * quest variables, skills or inventory are fabricated. */
+static bool client_try_move(Client *c, int srcX, int srcZ, int dx, int dz, int type, int locWidth, int locLength, int locRotation, int locShape, int forceapproach, bool tryNearest);
+static bool ba_bench_active;
+static void pos_trace(Client *c, const char *why, int jump, int arg_x, int arg_z) {
+    if(!r16_diag_verbose())return;
+    static uint64_t next;
+    uint64_t now = ba_timing_now();
+    /* "tick" is throttled. Teleports, steps, and click-to-move are not. */
+    int always = why && (strcmp(why, "teleport") == 0 || strcmp(why, "move") == 0 || strcmp(why, "step") == 0);
+    if (!always && now < next) return;
+    if (!always) next = now + 1000000ull;
+    PathingEntity *entity = c->local_player ? &c->local_player->pathing_entity : NULL;
+    int fine_x = entity ? entity->x : -1;
+    int fine_z = entity ? entity->z : -1;
+    int path_x = entity ? entity->pathTileX[0] : -1;
+    int path_z = entity ? entity->pathTileZ[0] : -1;
+    int path_len = entity ? entity->pathLength : -1;
+    int world_x = entity ? c->sceneBaseTileX + fine_x / 128 : 0;
+    int world_z = entity ? c->sceneBaseTileZ + fine_z / 128 : 0;
+    int click = c->shell ? c->shell->mouse_click_button : 0;
+    int click_x = c->shell ? c->shell->mouse_click_x : -1;
+    int click_y = c->shell ? c->shell->mouse_click_y : -1;
+    int mouse_x = c->shell ? c->shell->mouse_x : -1;
+    int mouse_y = c->shell ? c->shell->mouse_y : -1;
+    int queued = c->shell ? (c->shell->key_queue_write_pos - c->shell->key_queue_read_pos) & 0x7f : 0;
+    FILE *trace = fopen("ux0:/data/RS2Vita/pos-trace.txt", "a");
+    if (!trace) return;
+    fprintf(trace, "t=%llu why=%s jump=%d arg=%d,%d base=%d,%d center=%d,%d world=%d,%d path=%d,%d len=%d fine=%d,%d click=%d at=%d,%d mouse=%d,%d keys=%d yaw=%d\n",
+            (unsigned long long)now, why ? why : "", jump, arg_x, arg_z, c->sceneBaseTileX, c->sceneBaseTileZ, c->sceneCenterZoneX, c->sceneCenterZoneZ,
+            world_x, world_z, path_x, path_z, path_len, fine_x, fine_z, click, click_x, click_y, mouse_x, mouse_y, queued, c->orbit_camera_yaw);
+    fclose(trace);
+}
+static void ba_hardware_benchmark(Client*c){
+#ifdef BUILD_A_EMBEDDED
+ static int loaded,enabled,attempted,logout_seconds;
+ if(!loaded){loaded=1;FILE*f=fopen("ux0:/data/RS2Vita/hardware-benchmark.txt","r");if(f){fscanf(f,"%d %d",&enabled,&logout_seconds);fclose(f);}}
+ if(h5_mode()=='T')return;
+ /* A normal launch waits on the Login button. The world load starts there. */
+ if(enabled)ba_bench_active=true;
+ static uint64_t check;static unsigned lines;uint64_t now=ba_timing_now();
+ if(r16_diag_verbose()&&!h5_measuring()&&!h8_is_running()&&now>=check&&lines<24){check=now+5000000;FILE*f=fopen("ux0:/data/RS2Vita/benchmark-state.csv",lines?"a":"w");if(f){fprintf(f,"%llu,%d,%d,%d,%d,%d,%s|%s\n",(unsigned long long)now,c->ingame,c->scene_state,ba_server_ready(),c->local_player?c->local_player->pathing_entity.x/128+c->sceneBaseTileX:0,c->local_player?c->local_player->pathing_entity.z/128+c->sceneBaseTileZ:0,c->login_message0?c->login_message0:"",c->login_message1?c->login_message1:"");fclose(f);}lines++;}
+
+ if(enabled&&!c->ingame&&!attempted&&_Client.loop_cycle>50){attempted=1;strcpy(c->username,h5_username());strcpy(c->password,"test");client_login(c,c->username,c->password,false);}
+ if(c->ingame){
+ pos_trace(c, "tick", -1, 0, 0);
+ static unsigned h5_actions,h5_next_action;
+ if(c->scene_state==2&&h5_measuring()&&h5_actions<4&&_Client.loop_cycle>=h5_next_action&&(h5_mode()=='R'||h5_mode()=='I')){
+  h5_next_action=_Client.loop_cycle+400;h5_actions++;
+  int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];
+  if(h5_mode()=='R')client_try_move(c,sx,sz,sx+40,sz,0,0,0,0,0,0,true);
+  else if(h5_actions==1)client_try_move(c,sx,sz,sx+2,sz,0,0,0,0,0,0,true);
+  else for(int i=0;i<c->npc_count;i++){NpcEntity*n=c->npcs[c->npc_ids[i]];if(n&&n->type&&n->type->op&&n->type->op[0]&&strstr(n->type->op[0],"Talk")){extern void client_ui474_invoke(Client*,int,int,int,int);client_ui474_invoke(c,728,c->npc_ids[i],0,0);break;}}
+ }
+ return; /* H8 owns only explicitly armed benchmark actions. */
+ c->orbit_camera_yaw=0;c->orbit_camera_pitch=256;c->minimap_anticheat_angle=0;c->minimap_zoom=0;
+ static uint64_t world_since;static int moved,closed;if(c->scene_state==2&&!world_since)world_since=now;
+ if(world_since&&!moved&&logout_seconds>=330&&now-world_since>280000000u){moved=1;int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];bool accepted=client_try_move(c,sx,sz,sx+3,sz,0,0,0,0,0,0,true);FILE*f=fopen("ux0:/data/RS2Vita/benchmark-lifecycle.log","a");if(f){fprintf(f,"MOVE normal_client_route accepted=%d\n",accepted);fclose(f);}}
+ if(world_since&&!closed&&logout_seconds>0&&now-world_since>(uint64_t)logout_seconds*1000000u){closed=1;int x=c->sceneBaseTileX+c->local_player->pathing_entity.x/128,z=c->sceneBaseTileZ+c->local_player->pathing_entity.z/128;client_logout(c);FILE*f=fopen("ux0:/data/RS2Vita/benchmark-lifecycle.log","a");if(f){fprintf(f,"LOGOUT ordinary_client_logout ingame=%d x=%d z=%d\n",c->ingame,x,z);fclose(f);}}
+}
+#else
+ (void)c;
+#endif
+}
+
+void h8_game_step(void *context){
+ Client*c=context;static unsigned previous_running;unsigned kind,seconds,ui;
+ int ready=c->ingame&&c->scene_state==2&&c->local_player;
+ int x=ready?c->sceneBaseTileX+c->local_player->pathing_entity.x/128:0;
+ int z=ready?c->sceneBaseTileZ+c->local_player->pathing_entity.z/128:0;
+ if(ready&&h8_take_run(&kind,&seconds,&ui)){
+  extern int h8_set_ui(unsigned);h8_set_ui(ui);
+  c->redraw_sidebar=c->redraw_chatback=true;
+  c->orbit_camera_yaw=0;c->orbit_camera_pitch=256;
+  h8_begin(x,z,0,256,world3d_draw_radius(),_Client.lowmem);
+ }
+ unsigned step;
+ if(ready&&h8_action(&kind,&step)){
+  if(kind==1){
+   static const int dx[]={2,0,-2,0},dz[]={0,2,0,-2};
+   int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];
+   bool accepted=client_try_move(c,sx,sz,sx+dx[step],sz+dz[step],0,0,0,0,0,0,true);
+   h8_action_result(kind,step,sx+dx[step],sz+dz[step],accepted);
+  }else if(kind==2){c->orbit_camera_yaw=(int)step*512;c->orbit_camera_pitch=256;h8_action_result(kind,step,c->orbit_camera_yaw,256,1);}
+ }
+ h8_end_tick(x,z,c->orbit_camera_yaw,c->orbit_camera_pitch,world3d_draw_radius(),ready);
+ unsigned current=h8_is_running();
+ if(previous_running&&!current&&ready){
+  int sx=c->local_player->pathing_entity.x/128,sz=c->local_player->pathing_entity.z/128;
+  client_try_move(c,sx,sz,sx,sz,0,0,0,0,0,0,true);
+ }
+ previous_running=current;
+}
 void client_update(Client *c) {
+    ba_hardware_benchmark(c);
     if (c->error_started || c->error_loading || c->error_host) {
         return;
     }
@@ -891,6 +1211,11 @@ void handleChatMouseInput(Client *c, int mouseX, int mouseY) {
             continue;
         }
 
+        int rows = 1;
+#ifdef VITA_NATIVE_WIDESCREEN
+        rows = classic_chat_rows(c, i, _Custom.chat_era == 0 ? c->font_quill8 : c->font_plain12);
+        if (!rows) continue;
+#endif
         int type = c->message_type[i];
         int y = c->chat_scroll_offset + 70 + 4 - line * 14;
         if (y < -20) {
@@ -898,11 +1223,11 @@ void handleChatMouseInput(Client *c, int mouseX, int mouseY) {
         }
 
         if (type == 0) {
-            line++;
+            line += rows;
         }
 
         if ((type == 1 || type == 2) && (type == 1 || c->public_chat_setting == 0 || (c->public_chat_setting == 1 && client_is_friend(c, c->message_sender[i])))) {
-            if (mouseY > y - 14 && mouseY <= y && strcmp(c->message_sender[i], c->local_player->name) != 0) {
+            if (mouseY > y - 14 * rows && mouseY <= y && strcmp(c->message_sender[i], c->local_player->name) != 0) {
                 if (c->rights) {
                     sprintf(c->menu_option[c->menu_size], "Report abuse @whi@%s", c->message_sender[i]);
                     c->menu_action[c->menu_size] = 34;
@@ -917,11 +1242,11 @@ void handleChatMouseInput(Client *c, int mouseX, int mouseY) {
                 c->menu_size++;
             }
 
-            line++;
+            line += rows;
         }
 
         if ((type == 3 || type == 7) && c->split_private_chat == 0 && (type == 7 || c->private_chat_setting == 0 || (c->private_chat_setting == 1 && client_is_friend(c, c->message_sender[i])))) {
-            if (mouseY > y - 14 && mouseY <= y) {
+            if (mouseY > y - 14 * rows && mouseY <= y) {
                 if (c->rights) {
                     sprintf(c->menu_option[c->menu_size], "Report abuse @whi@%s", c->message_sender[i]);
                     c->menu_action[c->menu_size] = 34;
@@ -936,31 +1261,31 @@ void handleChatMouseInput(Client *c, int mouseX, int mouseY) {
                 c->menu_size++;
             }
 
-            line++;
+            line += rows;
         }
 
         if (type == 4 && (c->trade_chat_setting == 0 || (c->trade_chat_setting == 1 && client_is_friend(c, c->message_sender[i])))) {
-            if (mouseY > y - 14 && mouseY <= y) {
+            if (mouseY > y - 14 * rows && mouseY <= y) {
                 sprintf(c->menu_option[c->menu_size], "Accept trade @whi@%s", c->message_sender[i]);
                 c->menu_action[c->menu_size] = 903;
                 c->menu_size++;
             }
 
-            line++;
+            line += rows;
         }
 
         if ((type == 5 || type == 6) && c->split_private_chat == 0 && c->private_chat_setting < 2) {
-            line++;
+            line += rows;
         }
 
         if (type == 8 && (c->trade_chat_setting == 0 || (c->trade_chat_setting == 1 && client_is_friend(c, c->message_sender[i])))) {
-            if (mouseY > y - 14 && mouseY <= y) {
+            if (mouseY > y - 14 * rows && mouseY <= y) {
                 sprintf(c->menu_option[c->menu_size], "Accept duel @whi@%s", c->message_sender[i]);
                 c->menu_action[c->menu_size] = 363;
                 c->menu_size++;
             }
 
-            line++;
+            line += rows;
         }
     }
 }
@@ -1654,6 +1979,7 @@ void handleViewportOptions(Client *c) {
 }
 
 void client_handle_input(Client *c) {
+    BA_PROFILE_SCOPE(BA_INPUT);
     if (c->obj_drag_area != 0) {
         return;
     }
@@ -1664,25 +1990,26 @@ void client_handle_input(Client *c) {
     handlePrivateChatInput(c, c->shell->mouse_x, c->shell->mouse_y);
     c->lastHoveredInterfaceId = 0;
 
-    if (c->shell->mouse_x > 8 && c->shell->mouse_y > 11 && c->shell->mouse_x < 520 && c->shell->mouse_y < 345) {
+    if (((ve_enabled()?ve_world_input(c->shell->mouse_x,c->shell->mouse_y):game_world_input(c->shell->mouse_x,c->shell->mouse_y))&&!lc_game_covers(c->shell->mouse_x,c->shell->mouse_y))) {
         if (c->viewport_interface_id == -1) {
             handleViewportOptions(c);
         } else {
-            handleInterfaceInput(c, _Component.instances[c->viewport_interface_id], c->shell->mouse_x, c->shell->mouse_y, 8, 11, 0);
+            handleInterfaceInput(c, _Component.instances[c->viewport_interface_id], c->shell->mouse_x, c->shell->mouse_y, (ve_enabled()?224:8+GAME_MODAL_X)+client_modal_offset(c,c->viewport_interface_id,ve_enabled()), (ve_enabled()?0:11)+client_modal_y(c,c->viewport_interface_id,ve_enabled()), 0);
         }
     }
 
     if (c->lastHoveredInterfaceId != c->viewportHoveredInterfaceIndex) {
         c->viewportHoveredInterfaceIndex = c->lastHoveredInterfaceId;
+        ve_script_dirty = 1;
     }
 
     c->lastHoveredInterfaceId = 0;
 
-    if (c->shell->mouse_x > 562 && c->shell->mouse_y > 231 && c->shell->mouse_x < 752 && c->shell->mouse_y < 492) {
+    if (c->shell->mouse_x > ui474_side_x() && c->shell->mouse_y > ui474_side_y() && c->shell->mouse_x < (ui474_side_x()+190) && c->shell->mouse_y < (ui474_side_y()+261)) {
         if (c->sidebar_interface_id != -1) {
-            handleInterfaceInput(c, _Component.instances[c->sidebar_interface_id], c->shell->mouse_x, c->shell->mouse_y, 562, 231, 0);
+            handleInterfaceInput(c, _Component.instances[c->sidebar_interface_id], c->shell->mouse_x, c->shell->mouse_y, ui474_side_x(), ui474_side_y(), 0);
         } else if (c->tab_interface_id[c->selected_tab] != -1) {
-            handleInterfaceInput(c, _Component.instances[c->tab_interface_id[c->selected_tab]], c->shell->mouse_x, c->shell->mouse_y, 562, 231, 0);
+            if (!ui474_menu(c,c->shell->mouse_x,c->shell->mouse_y)) handleInterfaceInput(c, _Component.instances[c->tab_interface_id[c->selected_tab]], c->shell->mouse_x, c->shell->mouse_y, ui474_side_x(), ui474_side_y(), 0);
         }
     }
 
@@ -1693,11 +2020,11 @@ void client_handle_input(Client *c) {
 
     c->lastHoveredInterfaceId = 0;
 
-    if (c->shell->mouse_x > 22 && c->shell->mouse_y > 375 && c->shell->mouse_x < 431 && c->shell->mouse_y < 471) {
+    if ((!ve_enabled()||!ve_chat_hidden(c)) && (!lc_game_altered()||lc_contains(lc_game_geometry(LC_CHAT),c->shell->mouse_x,c->shell->mouse_y,true)) && c->shell->mouse_x > 22 && c->shell->mouse_y > (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))) && c->shell->mouse_x < 22 + lc_chat_text_right(CHAT_TEXT_RIGHT) && c->shell->mouse_y < lc_y(LC_CHAT,UI_BOTTOM(471))) {
         if (c->chat_interface_id == -1) {
-            handleChatMouseInput(c, c->shell->mouse_x - 22, c->shell->mouse_y - 375);
+            handleChatMouseInput(c, c->shell->mouse_x - (ve_enabled()?ve_chat_text_x():22), c->shell->mouse_y - (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
         } else {
-            handleInterfaceInput(c, _Component.instances[c->chat_interface_id], c->shell->mouse_x, c->shell->mouse_y, 22, 375, 0);
+            handleInterfaceInput(c, _Component.instances[c->chat_interface_id], c->shell->mouse_x, c->shell->mouse_y, 22, (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))), 0);
         }
     }
 
@@ -1878,37 +2205,7 @@ bool handleInterfaceAction(Client *c, Component *com) {
 }
 
 void handleScrollInput(Client *c, int mouseX, int mouseY, int scrollableHeight, int height, bool redraw, int left, int top, Component *component) {
-    if (c->scrollGrabbed) {
-        c->scrollInputPadding = 32;
-    } else {
-        c->scrollInputPadding = 0;
-    }
-
-    c->scrollGrabbed = false;
-
-    if (mouseX >= left && mouseX < left + 16 && mouseY >= top && mouseY < top + 16) {
-        component->scrollPosition -= c->drag_cycles * 4;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
-    } else if (mouseX >= left && mouseX < left + 16 && mouseY >= top + height - 16 && mouseY < top + height) {
-        component->scrollPosition += c->drag_cycles * 4;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
-    } else if (mouseX >= left - c->scrollInputPadding && mouseX < left + c->scrollInputPadding + 16 && mouseY >= top + 16 && mouseY < top + height - 16 && c->drag_cycles > 0) {
-        int gripSize = (height - 32) * height / scrollableHeight;
-        if (gripSize < 8) {
-            gripSize = 8;
-        }
-        int gripY = mouseY - top - gripSize / 2 - 16;
-        int maxY = height - gripSize - 32;
-        component->scrollPosition = (scrollableHeight - height) * gripY / maxY;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
-        c->scrollGrabbed = true;
-    }
+    client_handle_scroll_input(c,mouseX,mouseY,scrollableHeight,height,redraw,left,top,component);
 }
 
 void showContextMenu(Client *c) {
@@ -1922,21 +2219,21 @@ void showContextMenu(Client *c) {
     }
     width += 8;
 
-    int height = c->menu_size * 15 + 21;
+    int height = c->menu_size * 15 + 22;
 
     int x;
     int y;
-    if (c->shell->mouse_click_x > 8 && c->shell->mouse_click_y > 11 && c->shell->mouse_click_x < 520 && c->shell->mouse_click_y < 345) {
-        x = c->shell->mouse_click_x - width / 2 - 8;
-        if (x + width > 512) {
-            x = 512 - width;
+    if (ve_enabled()?ve_world_input(c->shell->mouse_click_x,c->shell->mouse_click_y):game_world_input(c->shell->mouse_click_x,c->shell->mouse_click_y)) {
+        x = c->shell->mouse_click_x - width / 2 - (ve_enabled()?0:8);
+        if (x + width > (ve_enabled()?SCREEN_WIDTH:GAME_MENU_WIDTH)) {
+            x = (ve_enabled()?SCREEN_WIDTH:GAME_MENU_WIDTH) - width;
         } else if (x < 0) {
             x = 0;
         }
 
-        y = c->shell->mouse_click_y - 11;
-        if (y + height > 334) {
-            y = 334 - height;
+        y = c->shell->mouse_click_y - (ve_enabled()?0:11);
+        if (y + height > (ve_enabled()?SCREEN_HEIGHT:GAME_MENU_HEIGHT)) {
+            y = (ve_enabled()?SCREEN_HEIGHT:GAME_MENU_HEIGHT) - height;
         } else if (y < 0) {
             y = 0;
         }
@@ -1948,15 +2245,15 @@ void showContextMenu(Client *c) {
         c->menu_width = width;
         c->menu_height = c->menu_size * 15 + 22;
     }
-    if (c->shell->mouse_click_x > 562 && c->shell->mouse_click_y > 231 && c->shell->mouse_click_x < 752 && c->shell->mouse_click_y < 492) {
-        x = c->shell->mouse_click_x - width / 2 - 562;
+    if (c->shell->mouse_click_x > ui474_side_x() && c->shell->mouse_click_y > ui474_side_y() && c->shell->mouse_click_x < (ui474_side_x()+190) && c->shell->mouse_click_y < (ui474_side_y()+261)) {
+        x = c->shell->mouse_click_x - width / 2 - ui474_side_x();
         if (x < 0) {
             x = 0;
         } else if (x + width > 190) {
             x = 190 - width;
         }
 
-        y = c->shell->mouse_click_y - 231;
+        y = c->shell->mouse_click_y - ui474_side_y();
         if (y < 0) {
             y = 0;
         } else if (y + height > 261) {
@@ -1970,15 +2267,15 @@ void showContextMenu(Client *c) {
         c->menu_width = width;
         c->menu_height = c->menu_size * 15 + 22;
     }
-    if (c->shell->mouse_click_x > 22 && c->shell->mouse_click_y > 375 && c->shell->mouse_click_x < 501 && c->shell->mouse_click_y < 471) {
+    if ((!lc_game_altered()||lc_contains(lc_game_geometry(LC_CHAT),c->shell->mouse_click_x,c->shell->mouse_click_y,true)) && c->shell->mouse_click_x > 22 && c->shell->mouse_click_y > (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))) && c->shell->mouse_click_x < 22 + CHAT_WIDTH && c->shell->mouse_click_y < lc_y(LC_CHAT,UI_BOTTOM(471))) {
         x = c->shell->mouse_click_x - width / 2 - 22;
         if (x < 0) {
             x = 0;
-        } else if (x + width > 479) {
-            x = 479 - width;
+        } else if (x + width > CHAT_WIDTH) {
+            x = CHAT_WIDTH - width;
         }
 
-        y = c->shell->mouse_click_y - 375;
+        y = c->shell->mouse_click_y - (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));
         if (y < 0) {
             y = 0;
         } else if (y + height > 96) {
@@ -1992,6 +2289,22 @@ void showContextMenu(Client *c) {
         c->menu_width = width;
         c->menu_height = c->menu_size * 15 + 22;
     }
+#ifdef __vita__
+    if (c->menu_visible && c->menu_size > 0) {
+        c->vita_menu_active = true;
+        c->vita_menu_selected = c->menu_size - 1; // first displayed row
+        c->vita_menu_confirm = c->vita_menu_cancel = false;
+        int ox = c->menu_area == 0 ? (ve_enabled()?0:8) : c->menu_area == 1 ? ui474_side_x() : 22;
+        int oy = c->menu_area == 0 ? (ve_enabled()?0:11) : c->menu_area == 1 ? ui474_side_y() : (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));
+        int mx = c->shell->mouse_x - ox, my = c->shell->mouse_y - oy;
+        for (int i = 0; i < c->menu_size; i++) {
+            int row_y = c->menu_y + (c->menu_size - 1 - i) * 15 + 31;
+            if (mx > c->menu_x && mx < c->menu_x + c->menu_width &&
+                my > row_y - 13 && my < row_y + 3) c->vita_menu_selected = i;
+        }
+    }
+#endif
+
 }
 
 bool isAddFriendOption(Client *c, int option) {
@@ -2118,7 +2431,7 @@ static void startForceMovement(PathingEntity *entity) {
     entity->yaw = entity->dstYaw;
 }
 
-static void updateMovement(PathingEntity *entity) {
+static void updateMovement(Client*c,PathingEntity *entity) {
     entity->secondarySeqId = entity->seqStandId;
 
     if (entity->pathLength == 0) {
@@ -2139,7 +2452,16 @@ static void updateMovement(PathingEntity *entity) {
     int dstX = entity->pathTileX[entity->pathLength - 1] * 128 + entity->size * 64;
     int dstZ = entity->pathTileZ[entity->pathLength - 1] * 128 + entity->size * 64;
 
-    if (dstX - x <= 256 && dstX - x >= -256 && dstZ - z <= 256 && dstZ - z >= -256) {
+    int recover_loading_gap=0;
+#if defined(BUILD_A_EMBEDDED) && defined(__vita__)
+    extern uint64_t ba_scene_motion_recover_until;
+    if(c->local_player&&entity==&c->local_player->pathing_entity&&entity->size==1&&c->currentLevel>=0&&c->currentLevel<4&&
+       (dstX-x>256||dstX-x< -256||dstZ-z>256||dstZ-z< -256)&&ba_timing_now()<ba_scene_motion_recover_until){
+        recover_loading_gap=r45_clear_recovery_segment(c->levelCollisionMap[c->currentLevel],x,z,dstX,dstZ);
+        if(recover_loading_gap){static uint64_t next_note;uint64_t now=ba_timing_now();if(now>=next_note){char line[160];snprintf(line,sizeof line,"# travel_path_recovery %llu from %d %d target %d %d path %d",(unsigned long long)now,x,z,dstX,dstZ,entity->pathLength);ba_cadence_diagnostic(line);next_note=now+250000u;}}
+    }
+#endif
+    if (recover_loading_gap || (dstX - x <= 256 && dstX - x >= -256 && dstZ - z <= 256 && dstZ - z >= -256)) {
         if (x < dstX) {
             if (z < dstZ) {
                 entity->dstYaw = 1280;
@@ -2247,7 +2569,7 @@ static void updateFacingDirection(Client *c, PathingEntity *e) {
             int dstZ = e->z - npc->pathing_entity.z;
 
             if (dstX != 0 || dstZ != 0) {
-                e->dstYaw = (int)(ATAN2(dstX, dstZ) * RADIANS_TO_RS) & 0x7ff;
+                e->dstYaw = (int)(atan2(dstX, dstZ) * 325.949) & 0x7ff;
             }
         }
     }
@@ -2264,7 +2586,7 @@ static void updateFacingDirection(Client *c, PathingEntity *e) {
             int dstZ = e->z - player->pathing_entity.z;
 
             if (dstX != 0 || dstZ != 0) {
-                e->dstYaw = (int)(ATAN2(dstX, dstZ) * RADIANS_TO_RS) & 0x7ff;
+                e->dstYaw = (int)(atan2(dstX, dstZ) * 325.949) & 0x7ff;
             }
         }
     }
@@ -2274,7 +2596,7 @@ static void updateFacingDirection(Client *c, PathingEntity *e) {
         int dstZ = e->z - (e->targetTileZ - c->sceneBaseTileZ - c->sceneBaseTileZ) * 64;
 
         if (dstX != 0 || dstZ != 0) {
-            e->dstYaw = (int)(ATAN2(dstX, dstZ) * RADIANS_TO_RS) & 0x7ff;
+            e->dstYaw = (int)(atan2(dstX, dstZ) * 325.949) & 0x7ff;
         }
 
         e->targetTileX = 0;
@@ -2306,6 +2628,7 @@ static void updateFacingDirection(Client *c, PathingEntity *e) {
 }
 
 static void updateSequences(PathingEntity *e) {
+    ba_timing_record(BA_ENTITY_STEP,0);
     e->seqStretches = false;
 
     SeqType *seq;
@@ -2368,6 +2691,23 @@ static void updateSequences(PathingEntity *e) {
     }
 }
 
+static void agility_state_probe(Client*c,PathingEntity*e){
+#if defined(__vita__) && defined(GL11)
+    static int previous[12],valid,was_active,samples;
+    if(!ba_agility_probe_enabled){valid=was_active=0;return;}
+    if(e!=&c->local_player->pathing_entity||samples>=512)return;
+    int active=e->primarySeqId>=0||e->forceMoveStartCycle>=_Client.loop_cycle||e->forceMoveEndCycle>_Client.loop_cycle;
+    if(!active&&!was_active)return;
+    int key[]={e->primarySeqId,e->primarySeqFrame,e->primarySeqDelay,e->secondarySeqId,e->secondarySeqFrame,e->forceMoveEndCycle,e->forceMoveStartCycle,e->x,e->z,e->pathLength,e->yaw,e->seqTrigger};
+    if(valid&&!memcmp(previous,key,sizeof key))return;
+    memcpy(previous,key,sizeof key);valid=1;was_active=active;samples++;
+    char line[320];snprintf(line,sizeof line,"# agility_state %llu logic %d seq %d frame %d cycle %d delay %d secondary %d/%d force %d/%d pos %d/%d path %d yaw %d",(unsigned long long)ba_timing_now(),_Client.loop_cycle,e->primarySeqId,e->primarySeqFrame,e->primarySeqCycle,e->primarySeqDelay,e->secondarySeqId,e->secondarySeqFrame,e->forceMoveEndCycle-_Client.loop_cycle,e->forceMoveStartCycle-_Client.loop_cycle,e->x,e->z,e->pathLength,e->yaw);
+    extern void ba_cadence_diagnostic(const char*);ba_cadence_diagnostic(line);
+#else
+    (void)c;(void)e;
+#endif
+}
+
 static void updateEntity(Client *c, PathingEntity *entity, int size) {
     (void)size;
     if (entity->x < 128 || entity->z < 128 || entity->x >= 13184 || entity->z >= 13184) {
@@ -2395,12 +2735,34 @@ static void updateEntity(Client *c, PathingEntity *entity, int size) {
     } else if (entity->forceMoveStartCycle >= _Client.loop_cycle) {
         startForceMovement(entity);
     } else {
-        updateMovement(entity);
+        updateMovement(c,entity);
     }
 
     updateFacingDirection(c, entity);
     updateSequences(entity);
+    agility_state_probe(c,entity);
 }
+
+#ifdef BUILD_A_EMBEDDED
+static void ba_sample_actor(unsigned kind,int id,PathingEntity *entity) {
+    static struct {int id,seq,frame;unsigned cycle;uint64_t wrap;} previous[2];
+    if(kind>=2)return;
+    int seq_id=entity->secondarySeqId,frame=entity->secondarySeqFrame;
+    if(seq_id<0||seq_id>=_SeqType.count)return;
+    if(previous[kind].id!=id||previous[kind].seq!=seq_id){previous[kind].wrap=0;previous[kind].frame=-1;}
+    if(frame<previous[kind].frame){
+        SeqType *seq=_SeqType.instances[seq_id];unsigned expected=0;
+        for(int i=0;i<seq->frameCount;i++)expected+=(unsigned)seq->delay[i]+1;
+        uint64_t now=ba_timing_now();
+        if(previous[kind].wrap){
+            FILE *f=fopen("ux0:/data/RS2Vita/actor-animation-loops.csv","a");
+            if(f){fprintf(f,"%llu,%u,%d,%d,%d,%u,%u,%llu,%d,%d\n",(unsigned long long)now,kind,id,seq_id,seq->frameCount,expected,_Client.loop_cycle-previous[kind].cycle,(unsigned long long)(now-previous[kind].wrap),entity->x,entity->z);fclose(f);}
+        }
+        previous[kind].wrap=now;previous[kind].cycle=_Client.loop_cycle;
+    }
+    previous[kind].id=id;previous[kind].seq=seq_id;previous[kind].frame=frame;
+}
+#endif
 
 void updatePlayers(Client *c) {
     for (int i = -1; i < c->player_count; i++) {
@@ -2414,6 +2776,9 @@ void updatePlayers(Client *c) {
         PlayerEntity *player = c->players[index];
         if (player) {
             updateEntity(c, &player->pathing_entity, 1);
+#ifdef BUILD_A_EMBEDDED
+            if(i==-1)ba_sample_actor(0,index,&player->pathing_entity);
+#endif
         }
     }
 
@@ -2450,6 +2815,9 @@ static void updateNpcs(Client *c) {
         NpcEntity *npc = c->npcs[id];
         if (npc) {
             updateEntity(c, &npc->pathing_entity, npc->type->size);
+#ifdef BUILD_A_EMBEDDED
+            if(i==0)ba_sample_actor(1,id,&npc->pathing_entity);
+#endif
         }
     }
 }
@@ -2528,6 +2896,7 @@ static void client_update_orbit_camera(Client *c) {
 }
 
 static bool client_try_move(Client *c, int srcX, int srcZ, int dx, int dz, int type, int locWidth, int locLength, int locRotation, int locShape, int forceapproach, bool tryNearest) {
+    pos_trace(c, "move", 0, dx, dz);
     int8_t sceneWidth = 104;
     int8_t sceneLength = 104;
     for (int x = 0; x < sceneWidth; x++) {
@@ -2934,6 +3303,19 @@ static void removeIgnore(Client *c, int64_t username) {
     }
 }
 
+#include "../r92_examine_speech.inc"
+
+static void useMenuOption(Client *cl, int optionId);
+void client_ui474_invoke(Client*c,int action,int a,int b,int component){int slot=399;int sa=c->menu_action[slot],pa=c->menuParamA[slot],pb=c->menuParamB[slot],pc=c->menuParamC[slot];c->menu_action[slot]=action;c->menuParamA[slot]=a;c->menuParamB[slot]=b;c->menuParamC[slot]=component;useMenuOption(c,slot);c->menu_action[slot]=sa;c->menuParamA[slot]=pa;c->menuParamB[slot]=pb;c->menuParamC[slot]=pc;}
+
+void client_vita_dialogue_action(Client *c, int component, int action) {
+    int slot=(int)(sizeof(c->menu_action)/sizeof(c->menu_action[0]))-1;
+    int savedAction=c->menu_action[slot],savedA=c->menuParamA[slot],savedB=c->menuParamB[slot],savedC=c->menuParamC[slot];
+    c->menu_action[slot]=action;c->menuParamA[slot]=c->menuParamB[slot]=0;c->menuParamC[slot]=component;
+    useMenuOption(c,slot);
+    c->menu_action[slot]=savedAction;c->menuParamA[slot]=savedA;c->menuParamB[slot]=savedB;c->menuParamC[slot]=savedC;
+}
+
 static void useMenuOption(Client *cl, int optionId) {
     if (optionId < 0) {
         return;
@@ -2948,6 +3330,11 @@ static void useMenuOption(Client *cl, int optionId) {
     int a = cl->menuParamA[optionId];
     int b = cl->menuParamB[optionId];
     int c = cl->menuParamC[optionId];
+
+#ifdef BUILD_A_EMBEDDED
+    FILE *action_trace=h5_measuring()?NULL:fopen("ux0:/data/RS2Vita/menu-actions.csv","a");
+    if(action_trace){fprintf(action_trace,"%llu,%d,%d,%d,%d,%d\n",(unsigned long long)ba_timing_now(),action,a,b,c,cl->obj_selected);fclose(action_trace);}
+#endif
 
     if (action >= 2000) {
         action -= 2000;
@@ -3119,12 +3506,12 @@ static void useMenuOption(Client *cl, int optionId) {
 
         char examine[MAX_STR];
         if (!loc->desc) {
-            sprintf(examine, "It's a %s.", loc->name);
+            snprintf(examine,sizeof examine, "It's a %s.", loc->name);
         } else {
-            strcpy(examine, loc->desc);
+            snprintf(examine,sizeof examine,"%s",loc->desc);
         }
 
-        client_add_message(cl, 0, examine, "");
+        client_examine_message(cl,examine);
     } else if (action == 285) {
         // OPLOC1
         interactWithLoc(cl, 245, b, c, a);
@@ -3172,9 +3559,10 @@ static void useMenuOption(Client *cl, int optionId) {
         }
     } else if (action == 660) {
         if (cl->menu_visible) {
-            world3d_click(b - 8, c - 11);
+            if ((ve_enabled()?ve_world_input(b,c):game_world_input(b,c))) world3d_click(ve_pointer(_Pix3D.center_x, b - (ve_enabled()?0:8)), ve_pointer(_Pix3D.center_y, c - (ve_enabled()?0:11)));
         } else {
-            world3d_click(cl->shell->mouse_click_x - 8, cl->shell->mouse_click_y - 11);
+            if (ve_enabled()?ve_world_input(cl->shell->mouse_click_x, cl->shell->mouse_click_y):game_world_input(cl->shell->mouse_click_x, cl->shell->mouse_click_y))
+                world3d_click(ve_pointer(_Pix3D.center_x, cl->shell->mouse_click_x - (ve_enabled()?0:8)), ve_pointer(_Pix3D.center_y, cl->shell->mouse_click_y - (ve_enabled()?0:11)));
         }
     } else if (action == 188) {
         cl->obj_selected = 1;
@@ -3199,14 +3587,14 @@ static void useMenuOption(Client *cl, int optionId) {
         char examine[MAX_STR];
 
         if (c >= 100000) {
-            sprintf(examine, "%d x %s", c, obj->name);
+            snprintf(examine,sizeof examine, "%d x %s", c, obj->name);
         } else if (obj->desc[0] == '\0') {
-            sprintf(examine, "It's a %s.", obj->name);
+            snprintf(examine,sizeof examine, "It's a %s.", obj->name);
         } else {
-            strcpy(examine, obj->desc);
+            snprintf(examine,sizeof examine,"%s",obj->desc);
         }
 
-        client_add_message(cl, 0, examine, "");
+        client_examine_message(cl,examine);
     } else if (action == 900) {
         NpcEntity *npc = cl->npcs[a];
 
@@ -3339,12 +3727,12 @@ static void useMenuOption(Client *cl, int optionId) {
             char examine[MAX_STR];
 
             if (!npc->type->desc) {
-                sprintf(examine, "It's a %s.", npc->type->name);
+                snprintf(examine,sizeof examine, "It's a %s.", npc->type->name);
             } else {
-                strcpy(examine, npc->type->desc);
+                snprintf(examine,sizeof examine,"%s",npc->type->desc);
             }
 
-            client_add_message(cl, 0, examine, "");
+            client_examine_message(cl,examine);
         }
     } else if (action == 504) {
         // OPLOC2
@@ -3398,6 +3786,7 @@ static void useMenuOption(Client *cl, int optionId) {
 
         if (notify) {
             // IF_BUTTON
+            ba_interface_trace("IF_BUTTON",c,"");
             p1isaac(cl->out, 155);
             p2(cl->out, c);
         }
@@ -3503,13 +3892,14 @@ static void useMenuOption(Client *cl, int optionId) {
         char examine[MAX_STR];
 
         if (obj->desc[0] == '\0') {
-            sprintf(examine, "It's a %s.", obj->name);
+            snprintf(examine,sizeof examine, "It's a %s.", obj->name);
         } else {
-            strcpy(examine, obj->desc);
+            snprintf(examine,sizeof examine,"%s",obj->desc);
         }
-        client_add_message(cl, 0, examine, "");
+        client_examine_message(cl,examine);
     } else if (action == 960) {
         // IF_BUTTON
+        ba_interface_trace("IF_BUTTON",c,"");
         p1isaac(cl->out, 155);
         p2(cl->out, c);
 
@@ -3561,6 +3951,7 @@ static void useMenuOption(Client *cl, int optionId) {
         }
     } else if (action == 465) {
         // IF_BUTTON
+        ba_interface_trace("IF_BUTTON",c,"");
         p1isaac(cl->out, 155);
         p2(cl->out, c);
 
@@ -3669,9 +4060,9 @@ static void applyCutscene(Client *c) {
     int deltaY = y - c->cameraY;
     int deltaZ = z - c->cameraZ;
 
-    int distance = (int)SQRT(deltaX * deltaX + deltaZ * deltaZ);
-    int pitch = (int)(ATAN2(deltaY, distance) * RADIANS_TO_RS) & 0x7ff;
-    int yaw = (int)(ATAN2(deltaX, deltaZ) * -RADIANS_TO_RS) & 0x7ff;
+    int distance = (int)sqrt(deltaX * deltaX + deltaZ * deltaZ);
+    int pitch = (int)(atan2(deltaY, distance) * 325.949) & 0x7ff;
+    int yaw = (int)(atan2(deltaX, deltaZ) * -325.949) & 0x7ff;
 
     if (pitch < 128) {
         pitch = 128;
@@ -3873,8 +4264,9 @@ static void handleInputKey(Client *c) {
                             } else if (strcmp(c->chat_typed, "::perf") == 0) {
                                 _Custom.show_performance = !_Custom.show_performance;
                             } else if (strcmp(c->chat_typed, "::gl") == 0) {
-#ifdef GL11
                                 _Custom.use_opengl11 = !_Custom.use_opengl11;
+
+#ifdef GL11
                                 char buf[MAX_STR];
                                 sprintf(buf, "OpenGL renderer is now %s.", _Custom.use_opengl11 ? "enabled" : "disabled");
                                 client_add_message(c, 0, buf, "");
@@ -4025,30 +4417,67 @@ static void handleInputKey(Client *c) {
     }
 }
 
+#include "../r91_popup_dismiss.inc"
+
 static void handleMouseInput(Client *c) {
+    if(client_dismiss_world_popup(c))return;
+    if (ui474_pointer(c,c->shell->mouse_click_x,c->shell->mouse_click_y,c->shell->mouse_click_button)) return;
     if (c->obj_drag_area != 0) {
         return;
     }
 
+#ifdef __vita__
+    static int menu_mouse_x = -1, menu_mouse_y = -1;
+    if (c->menu_visible && (c->shell->mouse_x != menu_mouse_x || c->shell->mouse_y != menu_mouse_y)) {
+        int ox=c->menu_area==0?(ve_enabled()?0:8):c->menu_area==1?ui474_side_x():22;
+        int oy=c->menu_area==0?(ve_enabled()?0:11):c->menu_area==1?ui474_side_y():(ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));
+        int mx=c->shell->mouse_x-ox,my=c->shell->mouse_y-oy;
+        for(int i=0;i<c->menu_size;i++) {
+            int row=c->menu_y+(c->menu_size-1-i)*15+31;
+            if(mx>c->menu_x&&mx<c->menu_x+c->menu_width&&my>row-13&&my<row+3)c->vita_menu_selected=i;
+        }
+    }
+    menu_mouse_x=c->shell->mouse_x;menu_mouse_y=c->shell->mouse_y;
+    if (!c->menu_visible) {
+        c->vita_menu_active = false;
+        c->vita_menu_confirm = c->vita_menu_cancel = false;
+    } else if (c->vita_menu_cancel || c->vita_menu_confirm) {
+        bool confirm = c->vita_menu_confirm && !c->vita_menu_cancel;
+        c->vita_menu_confirm = c->vita_menu_cancel = false;
+        if (confirm && c->vita_menu_selected >= 0 && c->vita_menu_selected < c->menu_size) {
+            useMenuOption(c, c->vita_menu_selected);
+        }
+        c->menu_visible = false;
+        c->vita_menu_active = false;
+        if (c->menu_area == 1) c->redraw_sidebar = true;
+        if (c->menu_area == 2) c->redraw_chatback = true;
+        return;
+    }
+#endif
+
     int button = c->shell->mouse_click_button;
-    if (c->spell_selected == 1 && c->shell->mouse_click_x >= 520 && c->shell->mouse_click_y >= 165 && c->shell->mouse_click_x <= 788 && c->shell->mouse_click_y <= 230) {
+    if (c->spell_selected == 1 && c->shell->mouse_click_x >= UI_RIGHT(520) && c->shell->mouse_click_y >= UI_BOTTOM(165) && c->shell->mouse_click_x <= UI_RIGHT(788) && c->shell->mouse_click_y <= UI_BOTTOM(230)) {
         button = 0;
     }
 
     if (c->menu_visible) {
+#ifdef __vita__
+        if (button != 1 && !c->vita_menu_active) {
+#else
         if (button != 1) {
+#endif
             int x = c->shell->mouse_x;
             int y = c->shell->mouse_y;
 
             if (c->menu_area == 0) {
-                x -= 8;
-                y -= 11;
+                x -= ve_enabled()?0:8;
+                y -= ve_enabled()?0:11;
             } else if (c->menu_area == 1) {
-                x -= 562;
-                y -= 231;
+                x -= ui474_side_x();
+                y -= ui474_side_y();
             } else if (c->menu_area == 2) {
                 x -= 22;
-                y -= 375;
+                y -= (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));
             }
 
             if (x < c->menu_x - 10 || x > c->menu_x + c->menu_width + 10 || y < c->menu_y - 10 || y > c->menu_y + c->menu_height + 10) {
@@ -4071,14 +4500,14 @@ static void handleMouseInput(Client *c) {
             int clickY = c->shell->mouse_click_y;
 
             if (c->menu_area == 0) {
-                clickX -= 8;
-                clickY -= 11;
+                clickX -= ve_enabled()?0:8;
+                clickY -= ve_enabled()?0:11;
             } else if (c->menu_area == 1) {
-                clickX -= 562;
-                clickY -= 231;
+                clickX -= ui474_side_x();
+                clickY -= ui474_side_y();
             } else if (c->menu_area == 2) {
                 clickX -= 22;
-                clickY -= 375;
+                clickY -= (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));
             }
 
             int option = -1;
@@ -4148,9 +4577,17 @@ static void handleMouseInput(Client *c) {
 }
 
 static void handleMinimapInput(Client *c) {
+    if(c->shell->mouse_click_button==1){char msg[96];snprintf(msg,sizeof(msg),"x=%d y=%d",c->shell->mouse_click_x,c->shell->mouse_click_y);ba_interface_trace("MINIMAP_INPUT",0,msg);}
+    if((ve_enabled()||lc_game_altered())&&!lc_contains(lc_game_geometry(LC_MINIMAP),c->shell->mouse_click_x,c->shell->mouse_click_y,true))return;
     if (c->shell->mouse_click_button == 1) {
-        int x = c->shell->mouse_click_x - 21 - 561;
-        int y = c->shell->mouse_click_y - 9 - 5;
+        int x,y;
+        if(ve_enabled()){
+            if(!ve_map_input_position(c->shell->mouse_click_x,c->shell->mouse_click_y,&x,&y))return;
+        }else{
+            x=c->shell->mouse_click_x-(21+lc_x(LC_MINIMAP,UI_RIGHT(561)));
+            y=c->shell->mouse_click_y-(9+lc_y(LC_MINIMAP,5));
+        }
+        if(ve_enabled()&&!ve_map_point(x,y))return;
 
         if (x >= 0 && y >= 0 && x < 146 && y < 151) {
             x -= 73;
@@ -4170,6 +4607,8 @@ static void handleMinimapInput(Client *c) {
             int tileZ = (c->local_player->pathing_entity.z - relY) >> 7;
 
             bool success = client_try_move(c, c->local_player->pathing_entity.pathTileX[0], c->local_player->pathing_entity.pathTileZ[0], tileX, tileZ, 1, 0, 0, 0, 0, 0, true);
+            if(ve_enabled()){FILE*trace=fopen("ux0:/data/RS2Vita/minimap-input.log","a");if(trace){fprintf(trace,"screen=%d,%d start=%d,%d target=%d,%d accepted=%d\n",c->shell->mouse_click_x,c->shell->mouse_click_y,c->sceneBaseTileX+c->local_player->pathing_entity.x/128,c->sceneBaseTileZ+c->local_player->pathing_entity.z/128,c->sceneBaseTileX+tileX,c->sceneBaseTileZ+tileZ,success);fclose(trace);}}
+            {char msg[128];snprintf(msg,sizeof(msg),"from=%d,%d dest=%d,%d success=%d",c->local_player->pathing_entity.pathTileX[0]+c->sceneBaseTileX,c->local_player->pathing_entity.pathTileZ[0]+c->sceneBaseTileZ,tileX+c->sceneBaseTileX,tileZ+c->sceneBaseTileZ,success);ba_interface_trace("MINIMAP_ROUTE",0,msg);}
             if (success) {
                 // the additional 14-bytes in MOVE_MINIMAPCLICK
                 p1(c->out, x);
@@ -4188,64 +4627,74 @@ static void handleMinimapInput(Client *c) {
     }
 }
 
+#include "r23_tutorial.h"
+
 static void handleTabInput(Client *c) {
+    if (ui474_enabled()) return;
+    int layout_click_x = c->shell->mouse_click_x-lc_dx(LC_SIDEBAR);
+    int layout_click_y = c->shell->mouse_click_y-lc_dy(LC_SIDEBAR);
+#ifdef VITA_NATIVE_WIDESCREEN
+    layout_click_x -= 171;
+    if (layout_click_y >= 177) layout_click_y -= 12;
+#endif
+
     if (c->shell->mouse_click_button != 1) {
         return;
     }
 
-    if (c->shell->mouse_click_x >= 549 && c->shell->mouse_click_x <= 583 && c->shell->mouse_click_y >= 195 && c->shell->mouse_click_y < 231 && c->tab_interface_id[0] != -1) {
+    if (layout_click_x >= 549 && layout_click_x <= 583 && layout_click_y >= 195 && layout_click_y < 231 && c->tab_interface_id[0] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 0;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 579 && c->shell->mouse_click_x <= 609 && c->shell->mouse_click_y >= 194 && c->shell->mouse_click_y < 231 && c->tab_interface_id[1] != -1) {
+    } else if (layout_click_x >= 579 && layout_click_x <= 609 && layout_click_y >= 194 && layout_click_y < 231 && c->tab_interface_id[1] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 1;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 607 && c->shell->mouse_click_x <= 637 && c->shell->mouse_click_y >= 194 && c->shell->mouse_click_y < 231 && c->tab_interface_id[2] != -1) {
+    } else if (layout_click_x >= 607 && layout_click_x <= 637 && layout_click_y >= 194 && layout_click_y < 231 && c->tab_interface_id[2] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 2;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 635 && c->shell->mouse_click_x <= 679 && c->shell->mouse_click_y >= 194 && c->shell->mouse_click_y < 229 && c->tab_interface_id[3] != -1) {
+    } else if (layout_click_x >= 635 && layout_click_x <= 679 && layout_click_y >= 194 && layout_click_y < 229 && c->tab_interface_id[3] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 3;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 676 && c->shell->mouse_click_x <= 706 && c->shell->mouse_click_y >= 194 && c->shell->mouse_click_y < 231 && c->tab_interface_id[4] != -1) {
+    } else if (layout_click_x >= 676 && layout_click_x <= 706 && layout_click_y >= 194 && layout_click_y < 231 && c->tab_interface_id[4] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 4;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 704 && c->shell->mouse_click_x <= 734 && c->shell->mouse_click_y >= 194 && c->shell->mouse_click_y < 231 && c->tab_interface_id[5] != -1) {
+    } else if (layout_click_x >= 704 && layout_click_x <= 734 && layout_click_y >= 194 && layout_click_y < 231 && c->tab_interface_id[5] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 5;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 732 && c->shell->mouse_click_x <= 766 && c->shell->mouse_click_y >= 195 && c->shell->mouse_click_y < 231 && c->tab_interface_id[6] != -1) {
+    } else if (layout_click_x >= 732 && layout_click_x <= 766 && layout_click_y >= 195 && layout_click_y < 231 && c->tab_interface_id[6] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 6;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 550 && c->shell->mouse_click_x <= 584 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 528 && c->tab_interface_id[7] != -1) {
+    } else if (layout_click_x >= 550 && layout_click_x <= 584 && layout_click_y >= 492 && layout_click_y < 528 && c->tab_interface_id[7] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 7;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 582 && c->shell->mouse_click_x <= 612 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 529 && c->tab_interface_id[8] != -1) {
+    } else if (layout_click_x >= 582 && layout_click_x <= 612 && layout_click_y >= 492 && layout_click_y < 529 && c->tab_interface_id[8] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 8;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 609 && c->shell->mouse_click_x <= 639 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 529 && c->tab_interface_id[9] != -1) {
+    } else if (layout_click_x >= 609 && layout_click_x <= 639 && layout_click_y >= 492 && layout_click_y < 529 && c->tab_interface_id[9] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 9;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 637 && c->shell->mouse_click_x <= 681 && c->shell->mouse_click_y >= 493 && c->shell->mouse_click_y < 528 && c->tab_interface_id[10] != -1) {
+    } else if (layout_click_x >= 637 && layout_click_x <= 681 && layout_click_y >= 493 && layout_click_y < 528 && c->tab_interface_id[10] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 10;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 679 && c->shell->mouse_click_x <= 709 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 529 && c->tab_interface_id[11] != -1) {
+    } else if (layout_click_x >= 679 && layout_click_x <= 709 && layout_click_y >= 492 && layout_click_y < 529 && c->tab_interface_id[11] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 11;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 706 && c->shell->mouse_click_x <= 736 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 529 && c->tab_interface_id[12] != -1) {
+    } else if (layout_click_x >= 706 && layout_click_x <= 736 && layout_click_y >= 492 && layout_click_y < 529 && c->tab_interface_id[12] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 12;
         c->redraw_sideicons = true;
-    } else if (c->shell->mouse_click_x >= 734 && c->shell->mouse_click_x <= 768 && c->shell->mouse_click_y >= 492 && c->shell->mouse_click_y < 528 && c->tab_interface_id[13] != -1) {
+    } else if (layout_click_x >= 734 && layout_click_x <= 768 && layout_click_y >= 492 && layout_click_y < 528 && c->tab_interface_id[13] != -1) {
         c->redraw_sidebar = true;
         c->selected_tab = 13;
         c->redraw_sideicons = true;
@@ -4261,12 +4710,24 @@ static void handleTabInput(Client *c) {
 }
 
 static void handleChatSettingsInput(Client *c) {
+#ifdef BUILD_A_EMBEDDED
+    if(c->shell->mouse_click_button){FILE*f=fopen("ux0:/data/RS2Vita/input-events.csv","a");if(f){fprintf(f,"%llu,CHAT_SETTINGS,%d,%d,%d,%d\n",(unsigned long long)ba_timing_now(),c->shell->mouse_click_x,c->shell->mouse_click_y,c->shell->mouse_click_button,ve_enabled()?ve_chat_button_at(c->shell->mouse_click_x,c->shell->mouse_click_y):-1);fclose(f);}}
+#endif
+    if(lc_game_altered()&&!lc_contains(lc_game_geometry(LC_CHAT),c->shell->mouse_click_x,c->shell->mouse_click_y,true))return;
+    int layout_click_x = c->shell->mouse_click_x-lc_dx(LC_CHAT);
+    int layout_click_y = c->shell->mouse_click_y-lc_dy(LC_CHAT);
+#ifdef VITA_NATIVE_WIDESCREEN
+    layout_click_y -= 12;
+#endif
+
+    if(ve_enabled()){if(c->shell->mouse_click_button!=1)return;int cell=ve_chat_button_at(c->shell->mouse_click_x,c->shell->mouse_click_y);if(cell<0)return;if(cell==4){ve_chat_toggle(c);return;}if(cell==5){p1isaac(c->out,155);p2(c->out,7746);return;}layout_click_x=84+168*cell;layout_click_y=506;}
     if (c->shell->mouse_click_button != 1) {
         return;
     }
 
-    if (c->shell->mouse_click_x >= 8 && c->shell->mouse_click_x <= 108 && c->shell->mouse_click_y >= 490 && c->shell->mouse_click_y <= 522) {
+    if (layout_click_x >= CHAT_BUTTON_LEFT(8, 0) && layout_click_x <= CHAT_BUTTON_RIGHT(108, 0) && layout_click_y >= 490 && layout_click_y <= 522) {
         c->public_chat_setting = (c->public_chat_setting + 1) % 4;
+        ve_privacy_save(c);
         c->redraw_privacy_settings = true;
         c->redraw_chatback = true;
 
@@ -4275,8 +4736,9 @@ static void handleChatSettingsInput(Client *c) {
         p1(c->out, c->public_chat_setting);
         p1(c->out, c->private_chat_setting);
         p1(c->out, c->trade_chat_setting);
-    } else if (c->shell->mouse_click_x >= 137 && c->shell->mouse_click_x <= 237 && c->shell->mouse_click_y >= 490 && c->shell->mouse_click_y <= 522) {
+    } else if (layout_click_x >= CHAT_BUTTON_LEFT(137, 1) && layout_click_x <= CHAT_BUTTON_RIGHT(237, 1) && layout_click_y >= 490 && layout_click_y <= 522) {
         c->private_chat_setting = (c->private_chat_setting + 1) % 3;
+        ve_privacy_save(c);
         c->redraw_privacy_settings = true;
         c->redraw_chatback = true;
 
@@ -4285,8 +4747,9 @@ static void handleChatSettingsInput(Client *c) {
         p1(c->out, c->public_chat_setting);
         p1(c->out, c->private_chat_setting);
         p1(c->out, c->trade_chat_setting);
-    } else if (c->shell->mouse_click_x >= 275 && c->shell->mouse_click_x <= 375 && c->shell->mouse_click_y >= 490 && c->shell->mouse_click_y <= 522) {
+    } else if (layout_click_x >= CHAT_BUTTON_LEFT(275, 2) && layout_click_x <= CHAT_BUTTON_RIGHT(375, 2) && layout_click_y >= 490 && layout_click_y <= 522) {
         c->trade_chat_setting = (c->trade_chat_setting + 1) % 3;
+        ve_privacy_save(c);
         c->redraw_privacy_settings = true;
         c->redraw_chatback = true;
 
@@ -4295,7 +4758,7 @@ static void handleChatSettingsInput(Client *c) {
         p1(c->out, c->public_chat_setting);
         p1(c->out, c->private_chat_setting);
         p1(c->out, c->trade_chat_setting);
-    } else if (c->shell->mouse_click_x >= 416 && c->shell->mouse_click_x <= 516 && c->shell->mouse_click_y >= 490 && c->shell->mouse_click_y <= 522) {
+    } else if (layout_click_x >= CHAT_BUTTON_LEFT(416, 3) && layout_click_x <= MIN(CHAT_CONTROLS_WIDTH - 1, CHAT_BUTTON_RIGHT(516, 3)) && layout_click_y >= 490 && layout_click_y <= 522) {
         closeInterfaces(c);
 
         c->reportAbuseInput[0] = '\0';
@@ -4341,15 +4804,23 @@ void client_update_game(Client *c) {
                 // bool failed = false;
                 // try {
                 // if (c->wave_ids[wave] != c->last_wave_id || c->wave_loops[wave] != c->last_wave_loops) {
+                uint64_t sound_begin=rs2_now();
                 Packet *buf = wave_generate(c->wave_ids[wave], c->wave_loops[wave]);
+                r94_audio_record(0,rs2_now()-sound_begin);
 
-                if (rs2_now() + (uint64_t)(buf->pos / 22) > c->last_wave_start_time + (uint64_t)(c->last_wave_length / 22)) {
+                if (buf && rs2_now() + (uint64_t)(buf->pos / 22) > c->last_wave_start_time + (uint64_t)(c->last_wave_length / 22)) {
                     c->last_wave_length = buf->pos;
                     c->last_wave_start_time = rs2_now();
                     // if (c->saveWave(buf->data, buf->pos)) {
                     c->last_wave_id = c->wave_ids[wave];
                     c->last_wave_loops = c->wave_loops[wave];
+#ifndef __vita__
+                    if(getenv("NATURE_AUDIO_CAPTURE_DIR"))rs2_log("NATURE_AUDIO_EVENT id=%d loops=%d bytes=%d ticks=%llu\n",c->wave_ids[wave],c->wave_loops[wave],buf->pos,(unsigned long long)rs2_now());
+#endif
+                    sound_begin=rs2_now();
+                    r108_sound_dispatched[c->wave_ids[wave]]++;
                     platform_play_wave(buf->data, buf->pos);
+                    r94_audio_record(1,rs2_now()-sound_begin);
                     // } else {
                     // 	failed = true;
                     // }
@@ -4416,6 +4887,7 @@ void client_update_game(Client *c) {
         }
 
         c->scene_delta++;
+        ba_timing_record(BA_SCENE_DELTA,0);
         if (c->cross_mode != 0) {
             c->cross_cycle += 20;
             if (c->cross_cycle >= 400) {
@@ -4494,6 +4966,7 @@ void client_update_game(Client *c) {
             int z = _World3D.clickTileZ;
             bool success = client_try_move(c, c->local_player->pathing_entity.pathTileX[0], c->local_player->pathing_entity.pathTileZ[0], x, z, 0, 0, 0, 0, 0, 0, true);
             _World3D.clickTileX = -1;
+            {char msg[96];snprintf(msg,sizeof(msg),"dest=%d,%d success=%d",x+c->sceneBaseTileX,z+c->sceneBaseTileZ,success);ba_interface_trace("WORLD_ROUTE",0,msg);}
 
             if (success) {
                 c->crossX = c->shell->mouse_click_x;
@@ -4512,6 +4985,14 @@ void client_update_game(Client *c) {
         handleMouseInput(c);
         handleMinimapInput(c);
         handleTabInput(c);
+        r23_tutorial_tab_ack(c);
+        /* Only redraw the retained sidebar at flash edges. Hit regions and
+         * the rest of the Enhanced HUD keep their existing retained path. */
+        if(ui474_enabled()){
+            static int tutorial_visual_key=-2;
+            int key=r23_tutorial_visual_key(c->flashing_tab,_Client.loop_cycle);
+            if(key!=tutorial_visual_key){tutorial_visual_key=key;c->redraw_sidebar=true;}
+        }
         handleChatSettingsInput(c);
 
         if (c->shell->mouse_button == 1 || c->shell->mouse_click_button == 1) {
@@ -4688,6 +5169,7 @@ bool client_read(Client *c) {
         if (c->varps[varp] != value) {
             c->varps[varp] = value;
             updateVarp(c, varp);
+            if(varp==323)c->redraw_chatback=c->redraw_privacy_settings=true;
             c->redraw_sidebar = true;
             if (c->sticky_chat_interface_id != -1) {
                 c->redraw_chatback = true;
@@ -4771,11 +5253,8 @@ bool client_read(Client *c) {
 #ifdef __EMSCRIPTEN__
             // TODO use indexeddb instead of emscripten memfs
             char filename[PATH_MAX];
-            sprintf(filename, "rom/cache/client/maps/m%d_%d", x, z);
+            sprintf(filename, "m%d_%d", x, z);
             FILE *file = fopen(filename, "wb");
-            if (!file) {
-                rs2_log("%s: %s\n", filename, strerror(errno));
-            }
             fwrite(c->sceneMapLandData[index], 1, c->sceneMapLandDataIndexLength[index], file);
             fclose(file);
 #endif
@@ -4793,6 +5272,7 @@ bool client_read(Client *c) {
     }
     if (c->packet_type == 237) {
         // REBUILD_NORMAL
+        uint64_t region_packet_at=ba_timing_now();
         int zoneX = g2(c->in);
         int zoneZ = g2(c->in);
         if (c->sceneCenterZoneX == zoneX && c->sceneCenterZoneZ == zoneZ && c->scene_state != 0) {
@@ -4807,7 +5287,7 @@ bool client_read(Client *c) {
         pixmap_bind(c->area_viewport);
         drawStringCenter(c->font_plain12, 257, 151, "Loading - please wait.", BLACK);
         drawStringCenter(c->font_plain12, 256, 150, "Loading - please wait.", WHITE);
-        pixmap_draw(c->area_viewport, 8, 11);
+        if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
         // signlink.looprate(5);
         int regions = (c->packet_size - 2) / 10;
 
@@ -4834,10 +5314,12 @@ bool client_read(Client *c) {
                 // data = signlink.cacheload("m" + mapsquareX + "_" + mapsquareZ);
                 // custom NOTE move these
                 char filename[PATH_MAX];
-#if defined(NXDK)
+#ifdef _arch_dreamcast
+                snprintf(filename, sizeof(filename), "cache/client/maps/m%d_%d.", mapsquareX, mapsquareZ);
+#elif defined(NXDK)
                 snprintf(filename, sizeof(filename), "D:\\cache\\client\\maps\\m%d_%d", mapsquareX, mapsquareZ);
-#elif defined(__NDS__)
-                snprintf(filename, sizeof(filename), "cache/client/maps/m%d_%d", mapsquareX, mapsquareZ);
+#elif defined(__EMSCRIPTEN__)
+                snprintf(filename, sizeof(filename), "m%d_%d", mapsquareX, mapsquareZ);
 #else
                 snprintf(filename, sizeof(filename), "rom/cache/client/maps/m%d_%d", mapsquareX, mapsquareZ);
 #endif
@@ -4876,7 +5358,7 @@ bool client_read(Client *c) {
 
                 if (data) {
                     if (rs_crc32(data, size) != landCrc) {
-                        // rs2_log("land data CRC check failed\n");
+                        // rs2_log("mapdata CRC check failed\n");
                         // free(data);
                         // data = NULL;
                     }
@@ -4896,12 +5378,14 @@ bool client_read(Client *c) {
                 // data = signlink.cacheload("l" + mapsquareX + "_" + mapsquareZ);
                 // custom NOTE move this
                 char filename[PATH_MAX];
-#if defined(NXDK)
+#ifdef _arch_dreamcast
+                snprintf(filename, sizeof(filename), "cache/client/maps/l%d_%d.", mapsquareX, mapsquareZ);
+#elif defined(NXDK)
                 snprintf(filename, sizeof(filename), "D:\\cache\\client\\maps\\l%d_%d", mapsquareX, mapsquareZ);
-#elif defined(__NDS__)
-                snprintf(filename, sizeof(filename), "cache/client/maps/m%d_%d", mapsquareX, mapsquareZ);
+#elif defined(__EMSCRIPTEN__)
+            snprintf(filename, sizeof(filename), "l%d_%d", mapsquareX, mapsquareZ);
 #else
-                snprintf(filename, sizeof(filename), "rom/cache/client/maps/l%d_%d", mapsquareX, mapsquareZ);
+            snprintf(filename, sizeof(filename), "rom/cache/client/maps/l%d_%d", mapsquareX, mapsquareZ);
 #endif
 
 #if ANDROID
@@ -4938,7 +5422,7 @@ bool client_read(Client *c) {
 
                 if (data) {
                     if (rs_crc32(data, size) != locCrc) {
-                        // rs2_log("loc data CRC check failed\n");
+                        // rs2_log("mapdata CRC check failed\n");
                         // free(data);
                         // data = NULL;
                     }
@@ -4962,7 +5446,7 @@ bool client_read(Client *c) {
             drawStringCenter(c->font_plain12, 257, 166, "Map area updated since last visit, so load will take longer this time only", BLACK);
             drawStringCenter(c->font_plain12, 256, 165, "Map area updated since last visit, so load will take longer this time only", WHITE);
         }
-        pixmap_draw(c->area_viewport, 8, 11);
+        if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
         int dx = c->sceneBaseTileX - c->mapLastBaseX;
         int dz = c->sceneBaseTileZ - c->mapLastBaseZ;
         c->mapLastBaseX = c->sceneBaseTileX;
@@ -5030,6 +5514,9 @@ bool client_read(Client *c) {
             c->flagSceneTileX -= dx;
             c->flagSceneTileZ -= dz;
         }
+        char region_line[192];
+        snprintf(region_line,sizeof region_line,"# region_packet %llu base %d %d maps %d us %llu",(unsigned long long)ba_timing_now(),c->sceneBaseTileX,c->sceneBaseTileZ,regions,(unsigned long long)(ba_timing_now()-region_packet_at));
+        ba_cadence_diagnostic(region_line);
         c->cutscene = false;
         c->packet_type = -1;
         return true;
@@ -5038,6 +5525,7 @@ bool client_read(Client *c) {
         // IF_SETPLAYERHEAD
         int com = g2(c->in);
         _Component.instances[com]->model = playerentity_get_headmodel(c->local_player);
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5112,14 +5600,11 @@ bool client_read(Client *c) {
             }
         }
         if (index != -1) {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__)
             // TODO use indexeddb instead of emscripten memfs
             char filename[PATH_MAX];
-            sprintf(filename, "rom/cache/client/maps/l%d_%d", x, z);
+            sprintf(filename, "l%d_%d", x, z);
             FILE *file = fopen(filename, "wb");
-            if (!file) {
-                rs2_log("%s: %s\n", filename, strerror(errno));
-            }
             fwrite(c->sceneMapLocData[index], 1, c->sceneMapLocDataIndexLength[index], file);
             fclose(file);
 #endif
@@ -5175,6 +5660,7 @@ bool client_read(Client *c) {
         if (c->varps[varp] != value) {
             c->varps[varp] = value;
             updateVarp(c, varp);
+            if(varp==323)c->redraw_chatback=c->redraw_privacy_settings=true;
             c->redraw_sidebar = true;
             if (c->sticky_chat_interface_id != -1) {
                 c->redraw_chatback = true;
@@ -5188,6 +5674,7 @@ bool client_read(Client *c) {
         int com = g2(c->in);
         int seqId = g2(c->in);
         _Component.instances[com]->anim = seqId;
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5241,22 +5728,26 @@ bool client_read(Client *c) {
     }
     if (c->packet_type == 98) {
         // UPDATE_INV_FULL
-        c->redraw_sidebar = true;
+        bool inv_changed=false;
         int com = g2(c->in);
         Component *inv = _Component.instances[com];
         int size = g1(c->in);
         for (int i = 0; i < size; i++) {
-            inv->invSlotObjId[i] = g2(c->in);
+            int incoming_id = g2(c->in);
             int count = g1(c->in);
             if (count == 255) {
                 count = g4(c->in);
             }
+            if(inv->invSlotObjId[i]!=incoming_id||inv->invSlotObjCount[i]!=count)inv_changed=true;
+            inv->invSlotObjId[i]=incoming_id;
             inv->invSlotObjCount[i] = count;
         }
         for (int i = size; i < inv->width * inv->height; i++) {
+            if(inv->invSlotObjId[i]||inv->invSlotObjCount[i])inv_changed=true;
             inv->invSlotObjId[i] = 0;
             inv->invSlotObjCount[i] = 0;
         }
+        if(inv_changed)c->redraw_sidebar=true;
         c->packet_type = -1;
         return true;
     }
@@ -5354,7 +5845,8 @@ bool client_read(Client *c) {
         int id = g2(c->in);
         int loop = g1(c->in);
         int delay = g2(c->in);
-        if (c->wave_enabled && !_Client.lowmem && c->wave_count < 50) {
+        if(id>=0&&id<1000)r108_sound_received[id]++;
+        if (c->wave_enabled && !_Client.lowmem && c->wave_count < 50 && wave_available(id)) {
             c->wave_ids[c->wave_count] = id;
             c->wave_loops[c->wave_count] = loop;
             c->wave_delay[c->wave_count] = delay + _Wave.delays[id];
@@ -5369,6 +5861,7 @@ bool client_read(Client *c) {
         int npcId = g2(c->in);
         NpcType *npc = npctype_get(npcId);
         _Component.instances[com]->model = npctype_get_headmodel(npc);
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5389,6 +5882,7 @@ bool client_read(Client *c) {
         if (model) {
             model_recolor(model, src, dst);
         }
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5397,6 +5891,7 @@ bool client_read(Client *c) {
         c->public_chat_setting = g1(c->in);
         c->private_chat_setting = g1(c->in);
         c->trade_chat_setting = g1(c->in);
+        ve_privacy_restore(c);
         c->redraw_privacy_settings = true;
         c->redraw_chatback = true;
         c->packet_type = -1;
@@ -5424,6 +5919,7 @@ bool client_read(Client *c) {
     }
     if (c->packet_type == 14) {
         // IF_OPENCHATMODAL
+        c->vita_dialogue_generation++;
         int com = g2(c->in);
         reset_interface_animation(com);
         if (c->sidebar_interface_id != -1) {
@@ -5446,6 +5942,7 @@ bool client_read(Client *c) {
         Component *inter = _Component.instances[com];
         inter->x = x;
         inter->y = z;
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5565,6 +6062,7 @@ bool client_read(Client *c) {
         int com = g2(c->in);
         int model = g2(c->in);
         _Component.instances[com]->model = model_from_id(model, false);
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5600,9 +6098,9 @@ bool client_read(Client *c) {
             int deltaX = sceneX - c->cameraX;
             int deltaY = sceneY - c->cameraY;
             int deltaZ = sceneZ - c->cameraZ;
-            int distance = (int)SQRT(deltaX * deltaX + deltaZ * deltaZ);
-            c->cameraPitch = (int)(ATAN2(deltaY, distance) * RADIANS_TO_RS) & 0x7ff;
-            c->cameraYaw = (int)(ATAN2(deltaX, deltaZ) * -RADIANS_TO_RS) & 0x7ff;
+            int distance = (int)sqrt(deltaX * deltaX + deltaZ * deltaZ);
+            c->cameraPitch = (int)(atan2(deltaY, distance) * 325.949) & 0x7ff;
+            c->cameraYaw = (int)(atan2(deltaX, deltaZ) * -325.949) & 0x7ff;
             if (c->cameraPitch < 128) {
                 c->cameraPitch = 128;
             }
@@ -5668,12 +6166,15 @@ bool client_read(Client *c) {
         _Component.instances[com]->xan = obj->xan2d;
         _Component.instances[com]->yan = obj->yan2d;
         _Component.instances[com]->zoom = obj->zoom2d * 100 / zoom;
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
     if (c->packet_type == 168) {
         // IF_OPENMAINMODAL
+        c->vita_skill_generation++;
         int com = g2(c->in);
+        ba_interface_trace("IF_OPENMAIN",com,"");
         reset_interface_animation(com);
         if (c->sidebar_interface_id != -1) {
             c->sidebar_interface_id = -1;
@@ -5701,6 +6202,7 @@ bool client_read(Client *c) {
         int g = color >> 5 & 0x1f;
         int b = color & 0x1f;
         _Component.instances[com]->colour = (r << 19) + (g << 11) + (b << 3);
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5724,6 +6226,7 @@ bool client_read(Client *c) {
         int com = g2(c->in);
         bool hide = g1(c->in) == 1;
         _Component.instances[com]->hide = hide;
+        ve_note_component(c, com);
         c->packet_type = -1;
         return true;
     }
@@ -5769,9 +6272,11 @@ bool client_read(Client *c) {
         // IF_SETTEXT
         int com = g2(c->in);
         char *text = gjstr(c->in);
-        realloc_and_copy(&_Component.instances[com]->text, text);
+        ba_interface_trace("IF_SETTEXT",com,text);
+        strcpy(_Component.instances[com]->text, text);
         free(text);
-        if (_Component.instances[com]->layer == c->tab_interface_id[c->selected_tab]) {
+        ve_note_component(c, com);
+        if (c->selected_tab >= 0 && c->selected_tab < 15 && _Component.instances[com]->layer == c->tab_interface_id[c->selected_tab]) {
             c->redraw_sidebar = true;
         }
         c->packet_type = -1;
@@ -5779,10 +6284,10 @@ bool client_read(Client *c) {
     }
     if (c->packet_type == 44) {
         // UPDATE_STAT
-        c->redraw_sidebar = true;
         int stat = g1(c->in);
         int xp = g4(c->in);
         int level = g1(c->in);
+        if(c->skillExperience[stat]!=xp||c->skillLevel[stat]!=level)c->redraw_sidebar=true;
         c->skillExperience[stat] = xp;
         c->skillLevel[stat] = level;
         c->skillBaseLevel[stat] = 1;
@@ -5830,7 +6335,7 @@ bool client_read(Client *c) {
     }
     if (c->packet_type == 213) {
         // UPDATE_INV_PARTIAL
-        c->redraw_sidebar = true;
+        bool inv_changed=false;
         int com = g2(c->in);
         Component *inv = _Component.instances[com];
         while (c->in->pos < c->packet_size) {
@@ -5841,10 +6346,12 @@ bool client_read(Client *c) {
                 count = g4(c->in);
             }
             if (slot >= 0 && slot < inv->width * inv->height) {
+                if(inv->invSlotObjId[slot]!=id||inv->invSlotObjCount[slot]!=count)inv_changed=true;
                 inv->invSlotObjId[slot] = id;
                 inv->invSlotObjCount[slot] = count;
             }
         }
+        if(inv_changed)c->redraw_sidebar=true;
         c->packet_type = -1;
         return true;
     }
@@ -5860,7 +6367,7 @@ bool client_read(Client *c) {
             pixmap_bind(c->area_viewport);
             drawStringCenter(c->font_plain12, 257, 151, "Loading - please wait.", BLACK);
             drawStringCenter(c->font_plain12, 256, 150, "Loading - please wait.", WHITE);
-            pixmap_draw(c->area_viewport, 8, 11);
+            if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
             _World.levelBuilt = c->currentLevel;
             client_build_scene(c);
         }
@@ -5901,6 +6408,7 @@ void getPlayerLocal(Client *c, Packet *buf, int size) {
         } else if (op == 1) {
             int walkDir = gbit(buf, 3);
             pathingentity_movealongroute(&c->local_player->pathing_entity, false, walkDir);
+            pos_trace(c, "step", 0, walkDir, 0);
 
             int extendedInfo = gbit(buf, 1);
             if (extendedInfo == 1) {
@@ -5911,6 +6419,7 @@ void getPlayerLocal(Client *c, Packet *buf, int size) {
             pathingentity_movealongroute(&c->local_player->pathing_entity, true, walkDir);
             int runDir = gbit(buf, 3);
             pathingentity_movealongroute(&c->local_player->pathing_entity, true, runDir);
+            pos_trace(c, "step", 1, walkDir, runDir);
 
             int extendedInfo = gbit(buf, 1);
             if (extendedInfo == 1) {
@@ -5927,6 +6436,7 @@ void getPlayerLocal(Client *c, Packet *buf, int size) {
             int localZ = gbit(buf, 7);
             int jump = gbit(buf, 1);
             pathingentity_teleport(&c->local_player->pathing_entity, jump == 1, localX, localZ);
+            pos_trace(c, "teleport", jump, localX, localZ);
 
             int extendedInfo = gbit(buf, 1);
             if (extendedInfo == 1) {
@@ -6067,7 +6577,8 @@ void getPlayerExtended2(Client *c, PlayerEntity *player, int index, int mask, Pa
         playerentity_read(player, appearance);
     }
     if ((mask & 0x2) == 2) {
-        int seqId = g2(buf);
+        int rawSeqId=g2(buf);
+        int seqId = ui474_player_sequence(rawSeqId);
         if (seqId == 65535) {
             seqId = -1;
         }
@@ -6075,6 +6586,8 @@ void getPlayerExtended2(Client *c, PlayerEntity *player, int index, int mask, Pa
             player->pathing_entity.primarySeqLoop = 0;
         }
         int delay = g1(buf);
+        if(ba_agility_probe_enabled&&player==c->local_player){char line[256];int frames=seqId>=0&&seqId<_SeqType.count&&_SeqType.instances[seqId]?_SeqType.instances[seqId]->frameCount:-1;snprintf(line,sizeof line,"# agility_packet %llu logic %d rawseq %d seq %d delay %d frames %d mask %d",(unsigned long long)ba_timing_now(),_Client.loop_cycle,rawSeqId,seqId,delay,frames,mask);ba_cadence_diagnostic(line);}
+
         if (seqId == -1 || player->pathing_entity.primarySeqId == -1 || _SeqType.instances[seqId]->priority > _SeqType.instances[player->pathing_entity.primarySeqId]->priority || _SeqType.instances[player->pathing_entity.primarySeqId]->priority == 0) {
             player->pathing_entity.primarySeqId = seqId;
             player->pathing_entity.primarySeqFrame = 0;
@@ -6167,6 +6680,8 @@ void getPlayerExtended2(Client *c, PlayerEntity *player, int index, int mask, Pa
         player->pathing_entity.forceMoveEndCycle = g2(buf) + _Client.loop_cycle;
         player->pathing_entity.forceMoveStartCycle = g2(buf) + _Client.loop_cycle;
         player->pathing_entity.forceMoveFaceDirection = g1(buf);
+        if(ba_agility_probe_enabled&&player==c->local_player){PathingEntity*e=&player->pathing_entity;char line[256];snprintf(line,sizeof line,"# agility_exact %llu logic %d start %d/%d end %d/%d offsets %d/%d face %d",(unsigned long long)ba_timing_now(),_Client.loop_cycle,e->forceMoveStartSceneTileX,e->forceMoveStartSceneTileZ,e->forceMoveEndSceneTileX,e->forceMoveEndSceneTileZ,e->forceMoveEndCycle-_Client.loop_cycle,e->forceMoveStartCycle-_Client.loop_cycle,e->forceMoveFaceDirection);ba_cadence_diagnostic(line);}
+
         player->pathing_entity.pathLength = 0;
         player->pathing_entity.pathTileX[0] = player->pathing_entity.forceMoveEndSceneTileX;
         player->pathing_entity.pathTileZ[0] = player->pathing_entity.forceMoveEndSceneTileZ;
@@ -6213,10 +6728,15 @@ static void client_clear_caches(void) {
     lrucache_clear(_ObjType.iconCache);
     lrucache_clear(_PlayerEntity.modelCache);
     lrucache_clear(_SpotAnimType.modelCache);
+    r57_reset_body_layers();
     bump_allocator_reset();
 }
 
 static void client_build_scene(Client *c) {
+    uint64_t region_at=ba_timing_now(),phase_at=region_at;
+    uint64_t reset_us=0,land_unpack_us=0,land_decode_us=0,loc_unpack_us=0,loc_place_us=0,build_us=0;
+    h5_mark("region_scene_build_begin");
+    BA_PROFILE_ALWAYS(BA_SCENE_BUILD);
     // try {
     c->minimap_level = -1;
     linklist_clear(c->merged_locations);
@@ -6231,8 +6751,10 @@ static void client_build_scene(Client *c) {
     }
 
     World *world = world_new(104, 104, c->levelHeightmap, c->levelTileFlags);
+    loctype_set_scene_origin(c->sceneBaseTileX,c->sceneBaseTileZ);
     _World.lowMemory = _World3D.lowMemory;
 
+    reset_us=ba_timing_now()-phase_at;
     int maps = c->sceneMapIndexLength;
 
     for (int index = 0; index < maps; index++) {
@@ -6264,9 +6786,19 @@ static void client_build_scene(Client *c) {
         if (src) {
             Packet *buf = packet_new(src, c->sceneMapLandDataIndexLength[i]);
             int length = g4(buf);
+            phase_at=ba_timing_now();
+#if defined(__vita__) && defined(BUILD_A_EMBEDDED)
+            uint32_t map_key=(uint32_t)c->sceneMapIndex[i];size_t source_n=(size_t)c->sceneMapLandDataIndexLength[i];
+            int cached=length>0&&length<=100000&&r109_get(map_key,src,source_n,data,(size_t)length);
+            if(!cached){bzip_decompress(data,src,c->sceneMapLandDataIndexLength[i]-4,4);if(length>0&&length<=100000)r109_put(map_key,src,source_n,data,(size_t)length);}
+#else
             bzip_decompress(data, src, c->sceneMapLandDataIndexLength[i] - 4, 4);
+#endif
+            land_unpack_us+=ba_timing_now()-phase_at;
             free(buf);
+            phase_at=ba_timing_now();
             world_load_ground(world, (c->sceneCenterZoneX - 6) * 8, (c->sceneCenterZoneZ - 6) * 8, x, z, data, length);
+            land_decode_us+=ba_timing_now()-phase_at;
         } else if (c->sceneCenterZoneZ < 800) {
             clearLandscape(world, z, x, 64, 64);
         }
@@ -6279,11 +6811,21 @@ static void client_build_scene(Client *c) {
         if (src) {
             Packet *buf = packet_new(src, c->sceneMapLocDataIndexLength[i]);
             int length = g4(buf);
+            phase_at=ba_timing_now();
+#if defined(__vita__) && defined(BUILD_A_EMBEDDED)
+            uint32_t map_key=0x10000u|(uint32_t)c->sceneMapIndex[i];size_t source_n=(size_t)c->sceneMapLocDataIndexLength[i];
+            int cached=length>0&&length<=100000&&r109_get(map_key,src,source_n,data,(size_t)length);
+            if(!cached){bzip_decompress(data,src,c->sceneMapLocDataIndexLength[i]-4,4);if(length>0&&length<=100000)r109_put(map_key,src,source_n,data,(size_t)length);}
+#else
             bzip_decompress(data, src, c->sceneMapLocDataIndexLength[i] - 4, 4);
+#endif
+            loc_unpack_us+=ba_timing_now()-phase_at;
             free(buf);
             int x = (c->sceneMapIndex[i] >> 8) * 64 - c->sceneBaseTileX;
             int z = (c->sceneMapIndex[i] & 0xff) * 64 - c->sceneBaseTileZ;
+            phase_at=ba_timing_now();
             world_load_locations(world, c->scene, c->locList, c->levelCollisionMap, data, length, x, z);
+            loc_place_us+=ba_timing_now()-phase_at;
         }
     }
 
@@ -6291,7 +6833,10 @@ static void client_build_scene(Client *c) {
 
     // NO_TIMEOUT
     p1isaac(c->out, 108);
+    phase_at=ba_timing_now();
     world_build(world, c->scene, c->levelCollisionMap);
+    build_us=ba_timing_now()-phase_at;
+    phase_at=ba_timing_now();
     pixmap_bind(c->area_viewport);
 
     // NO_TIMEOUT
@@ -6321,6 +6866,9 @@ static void client_build_scene(Client *c) {
     lrucache_clear(_LocType.modelCacheStatic);
     pix3d_init_pool(PIX3D_POOL_COUNT);
     world_free(world);
+    char region_line[384];
+    snprintf(region_line,sizeof region_line,"# region_build %llu base %d %d maps %d reset %llu land_unpack %llu land_decode %llu loc_unpack %llu loc_place %llu build %llu finish %llu total %llu",(unsigned long long)ba_timing_now(),c->sceneBaseTileX,c->sceneBaseTileZ,maps,(unsigned long long)reset_us,(unsigned long long)land_unpack_us,(unsigned long long)land_decode_us,(unsigned long long)loc_unpack_us,(unsigned long long)loc_place_us,(unsigned long long)build_us,(unsigned long long)(ba_timing_now()-phase_at),(unsigned long long)(ba_timing_now()-region_at));
+    ba_cadence_diagnostic(region_line);
 }
 
 void drawMinimapLoc(Client *c, int tileX, int tileZ, int level, int wallRgb, int doorRgb) {
@@ -6400,7 +6948,7 @@ void drawMinimapLoc(Client *c, int tileX, int tileZ, int level, int wallRgb, int
                 }
             }
         } else {
-            Pix8 *scene = c->image_mapscene[loc->mapscene];
+            Pix8 *scene = (ui_water_preview()&&locId==85&&loc->mapscene==22)?NULL:c->image_mapscene[loc->mapscene];
             if (scene) {
                 int offsetX = (loc->width * 4 - scene->width) / 2;
                 int offsetY = (loc->length * 4 - scene->height) / 2;
@@ -6418,7 +6966,7 @@ void drawMinimapLoc(Client *c, int tileX, int tileZ, int level, int wallRgb, int
         LocType *loc = loctype_get(locId);
 
         if (loc->mapscene != -1) {
-            Pix8 *scene = c->image_mapscene[loc->mapscene];
+            Pix8 *scene = (ui_water_preview()&&locId==85&&loc->mapscene==22)?NULL:c->image_mapscene[loc->mapscene];
             if (scene) {
                 int offsetX = (loc->width * 4 - scene->width) / 2;
                 int offsetY = (loc->length * 4 - scene->height) / 2;
@@ -6452,7 +7000,7 @@ void drawMinimapLoc(Client *c, int tileX, int tileZ, int level, int wallRgb, int
         int locId = bitset >> 14 & 0x7fff;
         LocType *loc = loctype_get(locId);
         if (loc->mapscene != -1) {
-            Pix8 *scene = c->image_mapscene[loc->mapscene];
+            Pix8 *scene = (ui_water_preview()&&locId==85&&loc->mapscene==22)?NULL:c->image_mapscene[loc->mapscene];
             if (scene) {
                 int offsetX = (loc->width * 4 - scene->width) / 2;
                 int offsetY = (loc->length * 4 - scene->height) / 2;
@@ -6553,9 +7101,11 @@ void createMinimap(Client *c, int level) {
             c->activeMapFunctionCount++;
         }
     }
+    ve_map_gl_invalidate();
 }
 
 void closeInterfaces(Client *c) {
+    ba_interface_trace("CLOSE_MODAL",c->viewport_interface_id,"");
     // CLOSE_MODAL
     p1isaac(c->out, 231);
 
@@ -6918,7 +7468,7 @@ void readZonePacket(Client *c, Packet *buf, int opcode) {
 
             player->locStartCycle = start + _Client.loop_cycle;
             player->locStopCycle = end + _Client.loop_cycle;
-            player->locModel = loctype_get_model(loc, shape, angle, y0, y1, y2, y3, -1);
+            player->locModel = loctype_get_model(loctype_visual_for_scene(loc,c->currentLevel,x,z,shape,angle), shape, angle, y0, y1, y2, y3, -1);
 
             int width = loc->width;
             int height = loc->length;
@@ -6969,6 +7519,25 @@ void readZonePacket(Client *c, Packet *buf, int opcode) {
     }
 }
 
+static void recovery_npc_trace(Client*c,NpcEntity*n,int id,const char*stage,int reason){
+#ifdef BUILD_A_EMBEDDED
+ if(!n||!n->type||!n->type->name||id<0||id>=8192)return;
+ if(strcmp(n->type->name,"Hans")&&strcmp(n->type->name,"Cook"))return;
+ static unsigned last[8192];static int previous[8192];
+ if(!strcmp(stage,"SCENE")){
+  if(previous[id]==reason&&_Client.loop_cycle-last[id]<50)return;
+  previous[id]=reason;last[id]=_Client.loop_cycle;
+ }
+ FILE*f=fopen("ux0:/data/RS2Vita/npc-presence.csv","a");
+ if(f){fprintf(f,"%llu,%s,%d,%s,%lld,%d,%d,%d,%d,%d\n",
+  (unsigned long long)ba_timing_now(),stage,id,n->type->name,(long long)n->type->index,
+  n->pathing_entity.x/128+c->sceneBaseTileX,n->pathing_entity.z/128+c->sceneBaseTileZ,
+  c->local_player->pathing_entity.x/128+c->sceneBaseTileX,
+  c->local_player->pathing_entity.z/128+c->sceneBaseTileZ,reason);fclose(f);}
+#else
+ (void)c;(void)n;(void)id;(void)stage;(void)reason;
+#endif
+}
 void getNpcPos(Client *c, Packet *buf, int size) {
     c->entityRemovalCount = 0;
     c->entityUpdateCount = 0;
@@ -6980,6 +7549,7 @@ void getNpcPos(Client *c, Packet *buf, int size) {
     for (int i = 0; i < c->entityRemovalCount; i++) {
         int index = c->entityRemovalIds[i];
         if (c->npcs[index]->pathing_entity.cycle != _Client.loop_cycle) {
+            recovery_npc_trace(c,c->npcs[index],index,"PACKET_REMOVE",0);
             c->npcs[index]->type = NULL;
             free(c->npcs[index]);
             c->npcs[index] = NULL;
@@ -7104,6 +7674,7 @@ void getNpcPosNewVis(Client *c, Packet *buf, int size) {
             dz -= 32;
         }
         pathingentity_teleport(&npc->pathing_entity, false, c->local_player->pathing_entity.pathTileX[0] + dx, c->local_player->pathing_entity.pathTileZ[0] + dz);
+        recovery_npc_trace(c,npc,index,"PACKET_ADD",0);
         int extendedInfo = gbit(buf, 1);
         if (extendedInfo == 1) {
             c->entityUpdateIds[c->entityUpdateCount++] = index;
@@ -7297,7 +7868,7 @@ void client_try_reconnect(Client *c) {
         drawStringCenter(c->font_plain12, 256, 143, "Connection lost", WHITE);
         drawStringCenter(c->font_plain12, 257, 159, "Please wait - attempting to reestablish", BLACK);
         drawStringCenter(c->font_plain12, 256, 158, "Please wait - attempting to reestablish", WHITE);
-        pixmap_draw(c->area_viewport, 8, 11);
+        if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
         c->flag_scene_tile_x = 0;
         ClientStream *stream = c->stream;
         c->ingame = false;
@@ -7308,7 +7879,7 @@ void client_try_reconnect(Client *c) {
         }
 
         // try {
-        clientstream_close(stream);
+        clientstream_destroy(stream);
         // } catch (@Pc(80) Exception ex) {
         // }
     }
@@ -7317,7 +7888,7 @@ void client_try_reconnect(Client *c) {
 void client_logout(Client *c) {
     // try {
     if (c->stream) {
-        clientstream_close(c->stream);
+        clientstream_destroy(c->stream);
     }
     // } catch (@Pc(9) Exception ignored) {
     // }
@@ -7346,49 +7917,96 @@ void client_logout(Client *c) {
     c->nextMusicDelay = 0;
 }
 
+static int title_new_player;
+int client_title_new_player(void){return title_new_player;}
+
 void client_update_title(Client *c) {
+ if(title_theme_pointer(c))return;
+ int click_x=c->shell->mouse_click_x,click_y=c->shell->mouse_click_y;
+ if(c->title_restored){
+        const ApprovedTitleControl *boxes=c->title_screen_state==0?approved_welcome_controls:approved_login_controls;
+        int count=c->title_screen_state==3?1:2;
+        if(c->title_screen_state==3)boxes=&approved_create_control;
+        bool button=false;
+        for(int i=0;i<count;i++)if(approved_title_contains(&boxes[i],click_x,click_y)){
+            click_x=TITLE_X(214)+boxes[i].logical_x;
+            click_y=TITLE_Y(186)+boxes[i].logical_y;
+            button=true;break;
+        }
+        if(!button){
+            int field=c->title_screen_state==2?approved_title_field_at(click_x,click_y):-1;
+            if(field>=0){click_x=TITLE_X(350);click_y=TITLE_Y(field?284:270);}
+            else {click_x=-1000;click_y=-1000;}
+        }
+    }
+
     if (c->title_screen_state == 0) {
-        int x = c->shell->screen_width / 2 - 80;
-        int y = c->shell->screen_height / 2 + 20;
+        int x = TITLE_X(394) - 80;
+        int y = TITLE_Y(266) + 20;
 
         y += 20;
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_x >= x - 75 && c->shell->mouse_click_x <= x + 75 && c->shell->mouse_click_y >= y - 20 && c->shell->mouse_click_y <= y + 20) {
+        if (c->shell->mouse_click_button == 1 && title_button_contains(click_x, click_y, x, y)) {
             c->title_screen_state = 3;
             c->title_login_field = 0;
+#ifdef BUILD_A_EMBEDDED
+            title_new_player=1;c->title_screen_state=2;
+            c->username[0]=c->password[0]=0;
+            c->login_message0="";c->login_message1="Choose a new offline username & password.";
+#endif
         }
 
-        x = c->shell->screen_width / 2 + 80;
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_x >= x - 75 && c->shell->mouse_click_x <= x + 75 && c->shell->mouse_click_y >= y - 20 && c->shell->mouse_click_y <= y + 20) {
+        x = TITLE_X(394) + 80;
+        if (c->shell->mouse_click_button == 1 && title_button_contains(click_x, click_y, x, y)) {
             c->login_message0 = "";
             c->login_message1 = "Enter your username & password.";
+            title_new_player=0;
             c->title_screen_state = 2;
             c->title_login_field = 0;
         }
     } else if (c->title_screen_state == 2) {
-        int y = c->shell->screen_height / 2 - 40;
+        int y = TITLE_Y(266) - 40;
         y += 30;
         y += 25;
 
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_y >= y - 15 && c->shell->mouse_click_y < y) {
+#ifdef VITA_NATIVE_WIDESCREEN
+        int field = title_login_field_at(click_x, click_y);
+        if (c->shell->mouse_click_button == 1 && field >= 0) c->title_login_field = field;
+#else
+        if (c->shell->mouse_click_button == 1 && click_y >= y - 15 && click_y < y) {
             c->title_login_field = 0;
         }
+#endif
         y += 15;
 
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_y >= y - 15 && c->shell->mouse_click_y < y) {
+#ifndef VITA_NATIVE_WIDESCREEN
+        if (c->shell->mouse_click_button == 1 && click_y >= y - 15 && click_y < y) {
             c->title_login_field = 1;
         }
+#endif
         y += 15;
 
-        int buttonX = c->shell->screen_width / 2 - 80;
-        int buttonY = c->shell->screen_height / 2 + 50;
+        int buttonX = TITLE_X(394) - 80;
+        int buttonY = TITLE_Y(266) + 50;
         buttonY += 20;
 
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_x >= buttonX - 75 && c->shell->mouse_click_x <= buttonX + 75 && c->shell->mouse_click_y >= buttonY - 20 && c->shell->mouse_click_y <= buttonY + 20) {
+        if (c->shell->mouse_click_button == 1 && title_button_contains(click_x, click_y, buttonX, buttonY)) {
+#ifdef BUILD_A_EMBEDDED
+            if(title_new_player){
+                int64_t key=jstring_to_base37(c->username);
+                if(key<=0){c->login_message0="";c->login_message1="Please choose a valid player name.";return;}
+                char*name=jstring_from_base37(key);char path[180];
+                snprintf(path,sizeof(path),"ux0:/data/RS2Vita/players/%s.sav",name);
+                FILE*f=fopen(path,"rb");int exists=f!=NULL;if(f)fclose(f);
+                snprintf(path,sizeof(path),"ux0:/data/RS2Vita/players/%s.sav.bak",name);free(name);
+                f=fopen(path,"rb");if(f){exists=1;fclose(f);}
+                if(exists){c->login_message0="That local player already exists.";c->login_message1="Use Existing User to load that player.";return;}
+            }
+#endif
             client_login(c, c->username, c->password, false);
         }
 
-        buttonX = c->shell->screen_width / 2 + 80;
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_x >= buttonX - 75 && c->shell->mouse_click_x <= buttonX + 75 && c->shell->mouse_click_y >= buttonY - 20 && c->shell->mouse_click_y <= buttonY + 20) {
+        buttonX = TITLE_X(394) + 80;
+        if (c->shell->mouse_click_button == 1 && title_button_contains(click_x, click_y, buttonX, buttonY)) {
             c->title_screen_state = 0;
             if (!_Custom.remember_username) {
                 c->username[0] = '\0';
@@ -7452,15 +8070,36 @@ void client_update_title(Client *c) {
             }
         }
     } else if (c->title_screen_state == 3) {
-        int x = c->shell->screen_width / 2;
-        int y = c->shell->screen_height / 2 + 50;
+        int x = TITLE_X(394);
+        int y = TITLE_Y(266) + 50;
         y += 20;
 
-        if (c->shell->mouse_click_button == 1 && c->shell->mouse_click_x >= x - 75 && c->shell->mouse_click_x <= x + 75 && c->shell->mouse_click_y >= y - 20 && c->shell->mouse_click_y <= y + 20) {
+        if (c->shell->mouse_click_button == 1 && title_button_contains(click_x, click_y, x, y)) {
             c->title_screen_state = 0;
         }
     }
 }
+
+#ifdef BUILD_A_EMBEDDED
+static void login_world_progress(void *ctx, int percent, const char *text) {
+    Client *c = ctx;
+    if (!c) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    static int last_percent = -1;
+    static uint64_t last_draw;
+    uint64_t now = rs2_now();
+    if (percent != 100 && percent == last_percent) return;
+    if (percent != 100 && last_draw && now - last_draw < 80) return;
+    last_percent = percent;
+    last_draw = now;
+    char line[96];
+    snprintf(line, sizeof(line), "%s - %d%%", text && text[0] ? text : "Building world", percent);
+    client_draw_progress(c, line, percent);
+    FILE *f = fopen("ux0:/data/RS2Vita/world-load.txt", "a");
+    if (f) { fprintf(f, "%d %s\n", percent, line); fclose(f); }
+}
+#endif
 
 void client_login(Client *c, const char *username, const char *password, bool reconnect) {
     // signlink.errorname = username;
@@ -7471,11 +8110,20 @@ void client_login(Client *c, const char *username, const char *password, bool re
         client_draw_title_screen(c);
     }
     platform_update_surface();
+#ifdef BUILD_A_EMBEDDED
+    if (!reconnect) {
+        client_draw_progress(c, "Building world - 0%", 0);
+        ba_progress_set(login_world_progress, c);
+    }
+#endif
 
 #ifdef __wasm
     c->stream = clientstream_opensocket(_Custom.http_port);
 #else
     c->stream = clientstream_opensocket(_Client.portoff + 43594);
+#endif
+#ifdef BUILD_A_EMBEDDED
+    ba_progress_set(NULL, NULL);
 #endif
     if (!c->stream) {
         goto login_fail;
@@ -7529,6 +8177,7 @@ void client_login(Client *c, const char *username, const char *password, bool re
     clientstream_write(c->stream, c->login->data, c->login->pos, 0);
 
     int reply = clientstream_read_byte(c->stream);
+    if(getenv("CLASSIC_MIGRATION_TEST"))rs2_log("RESEARCH login reply=%d\n",reply);
     if (reply == 1) {
         rs2_sleep(2000);
         client_login(c, username, password, reconnect);
@@ -7536,6 +8185,10 @@ void client_login(Client *c, const char *username, const char *password, bool re
         c->rights = reply == 18;
         inputtracking_set_disabled(&_InputTracking);
 
+        /* End the title soundtrack before accepting the new world's music. */
+        platform_stop_midi();
+        c->currentMidi[0] = '\0';
+        c->nextMusicDelay = 0;
         c->ingame = true;
         c->out->pos = 0;
         c->in->pos = 0;
@@ -7703,6 +8356,7 @@ login_fail:
 }
 
 void client_prepare_game_screen(Client *c) {
+    ve_release(c);
     if (c->area_chatback) {
         return;
     }
@@ -7731,20 +8385,21 @@ void client_prepare_game_screen(Client *c) {
     c->image_title6 = NULL;
     c->image_title7 = NULL;
     c->image_title8 = NULL;
-    c->area_chatback = pixmap_new(479, 96);
+    c->area_chatback = pixmap_new(CHAT_WIDTH, 96);
     c->area_mapback = pixmap_new(168, 160);
     pix2d_clear();
     pix8_draw(c->image_mapback, 0, 0);
     c->area_sidebar = pixmap_new(190, 261);
-    c->area_viewport = pixmap_new(512, 334);
+    c->area_viewport = pixmap_new(GAME_VIEW_WIDTH, GAME_VIEW_HEIGHT);
     pix2d_clear();
-    c->area_backbase1 = pixmap_new(501, 61);
+    c->area_backbase1 = pixmap_new(CHAT_CONTROLS_WIDTH, 61);
     c->area_backbase2 = pixmap_new(288, 40);
-    c->area_backhmid1 = pixmap_new(269, 66);
+    c->area_backhmid1 = pixmap_new(269, SIDE_TABS_HEIGHT);
     c->redraw_background = true;
 }
 
 void client_unload_title(Client *c) {
+    vita_title_invalidate();
     c->flame_active = false;
     pix8_free(c->image_titlebox);
     pix8_free(c->image_titlebutton);
@@ -7765,6 +8420,7 @@ void client_unload_title(Client *c) {
     pix24_free(c->image_flames_right);
 #endif
 
+    if(c->title_restored){pixmap_free(c->title_panel_scaled);pix24_free(c->title_panel_background);c->title_panel_scaled=NULL;c->title_panel_background=NULL;pixmap_free(c->title_flame_left);pixmap_free(c->title_flame_right);pixmap_free(c->title_flame_clip_left);pixmap_free(c->title_flame_clip_right);c->title_restored=false;}
     c->image_titlebox = NULL;
     c->image_titlebutton = NULL;
     for (int i = 0; i < 12; i++) {
@@ -7798,14 +8454,455 @@ void client_validate_character_design(Client *c) {
     }
 }
 
+static int integration_inventory_slot(int com,int obj){if(com<0||com>=_Component.count)return -1;Component*t=_Component.instances[com];if(!t||!t->invSlotObjId)return -1;for(int i=0;i<t->width*t->height;i++)if(t->invSlotObjId[i]==obj+1)return i;return -1;}
+static void migration_research_driver(Client *c) {
+    if (!getenv("CLASSIC_MIGRATION_TEST")) return;
+    static int login_attempted=0,game_frames=0,previous_sequence=-999,previous_primary=-999;
+    if (!c->ingame && !login_attempted && _Client.loop_cycle>50) {login_attempted=1;client_login(c,c->username,c->password,false);rs2_log("RESEARCH login requested ingame=%d message=%s\n",c->ingame,c->login_message1);}
+    if (!c->ingame || c->scene_state!=2 || !c->local_player) return;
+    game_frames++;
+    if(previous_primary!=c->local_player->pathing_entity.primarySeqId){previous_primary=c->local_player->pathing_entity.primarySeqId;rs2_log("RESEARCH primary sequence transition=%d game_frame=%d\n",previous_primary,game_frames);}
+    if(previous_sequence!=c->local_player->pathing_entity.secondarySeqId){previous_sequence=c->local_player->pathing_entity.secondarySeqId;rs2_log("RESEARCH sequence transition=%d game_frame=%d\n",previous_sequence,game_frames);}
+    if(getenv("TEMPLE_CONTROL_TEST")){
+if(getenv("PIP_JOURNAL_INPUT_TEST")){
+ static uint64_t jb=0;static int js=0;uint64_t jnow=rs2_now();if(!jb)jb=jnow;
+ int target=7630,mode=getenv("PIP_JOURNAL_INPUT_MODE")?atoi(getenv("PIP_JOURNAL_INPUT_MODE")):0;
+ Component*root=_Component.instances[638],*parent=_Component.instances[639],*entry=_Component.instances[target];
+ if(js==0&&jnow-jb>1800){int ri=-1,ti=-1;for(int i=0;i<root->childCount;i++)if(root->childId[i]==639)ri=i;for(int i=0;i<parent->childCount;i++)if(parent->childId[i]==target)ti=i;if(ri<0||ti<0||!entry||entry->buttonType!=BUTTON_OK)abort();
+ for(int i=0;i<14;i++)if(c->tab_interface_id[i]==638){c->selected_tab=i;c->redraw_sideicons=true;}
+ int left=ui474_side_x()+root->childX[ri]+parent->x,top=ui474_side_y()+root->childY[ri]+parent->y,max=parent->scroll-parent->height;parent->scrollPosition=0;c->drag_cycles=1;
+ for(int i=0;i<1000&&parent->scrollPosition<max;i++)handleScrollInput(c,left+parent->width+8,top+parent->height-8,parent->scroll,parent->height,true,left+parent->width,top,parent);
+ if(parent->scrollPosition>max)parent->scrollPosition=max;if(parent->scrollPosition!=max)abort();int before=parent->scrollPosition;handleScrollInput(c,left+parent->width+8,top+8,parent->scroll,parent->height,true,left+parent->width,top,parent);if(parent->scrollPosition!=before-4)abort();handleScrollInput(c,left+parent->width+8,top+parent->height-8,parent->scroll,parent->height,true,left+parent->width,top,parent);if(parent->scrollPosition!=before)abort();c->drag_cycles=0;c->redraw_sidebar=true;rs2_log("PIP_JOURNAL_SCROLL mode=%d max=%d original_bounds=%d,%d,%d,%d entry=%d,%d,%d,%d\n",mode,max,left,top,parent->width,parent->height,parent->childX[ti],parent->childY[ti],entry->width,entry->height);js=1;}
+ if(js==1&&jnow-jb>5500){int ri=-1,ti=-1;for(int i=0;i<root->childCount;i++)if(root->childId[i]==639)ri=i;for(int i=0;i<parent->childCount;i++)if(parent->childId[i]==target)ti=i;int x=ui474_side_x()+root->childX[ri]+parent->x+parent->childX[ti]+entry->x+entry->width/2,y=ui474_side_y()+root->childY[ri]+parent->y+parent->childY[ti]+entry->y-parent->scrollPosition+entry->height/2;
+ c->menu_size=0;c->menu_visible=false;handleInterfaceInput(c,root,x,y,ui474_side_x(),ui474_side_y(),0);int found=-1;for(int i=0;i<c->menu_size;i++)if(c->menuParamC[i]==target&&c->menu_action[i]==951)found=i;if(found<0)abort();if(found!=c->menu_size-1)abort();int oldbutton=c->shell->mouse_click_button,oldx=c->shell->mouse_click_x,oldy=c->shell->mouse_click_y;c->shell->mouse_click_button=1;c->shell->mouse_click_x=x;c->shell->mouse_click_y=y;handleMouseInput(c);c->shell->mouse_click_button=oldbutton;c->shell->mouse_click_x=oldx;c->shell->mouse_click_y=oldy;rs2_log("PIP_JOURNAL_CLICK component=%d original_action=951 mode=%d path=shared_pointer_dispatch\n",target,mode);js=2;}
+ if(js==2&&jnow-jb>9500){if(c->viewport_interface_id<0)abort();rs2_log("PIP_JOURNAL_OPEN actual_root=%d mode=%d\n",c->viewport_interface_id,mode);js=3;}
+ if(js==3&&jnow-jb>13500){vita_dialogue_input(c,false,false,0,false);vita_dialogue_input(c,false,true,0,false);vita_dialogue_input(c,false,true,0,false);rs2_log("PIP_JOURNAL_CLOSE via=production_vita_dialogue_input held_probe=1 mode=%d\n",mode);js=4;}
+ if(js==4&&jnow-jb>16500){if(c->viewport_interface_id>=0)abort();rs2_log("PIP_JOURNAL_INPUT_PASS mode=%d physical_device_test=0\n",mode);js=5;}return;}
+
+ static uint64_t action_at=0,page_at=0,status_at=0;static int executed=-1;static unsigned long lastpage=0;uint64_t now=rs2_now();
+ int sequence=0,kind=0,a=0,b=0,zarg=0,option=0,item=-1,component=3214;char line[1024]={0},wanted[512]={0};
+ FILE*f=fopen("/research/scripts/TEMPLE_CONTROL.txt","r");if(f){fgets(line,sizeof(line),f);fclose(f);sscanf(line,"%d %d %d %d %d %d %d %d",&sequence,&kind,&a,&b,&zarg,&option,&item,&component);char*q=strchr(line,'|');if(q){snprintf(wanted,sizeof(wanted),"%s",q+1);wanted[strcspn(wanted,"\r\n")]=0;}}
+ int px=c->local_player->pathing_entity.x/128+c->sceneBaseTileX,pz=c->local_player->pathing_entity.z/128+c->sceneBaseTileZ;
+ static int frame_yaw=512;c->orbit_camera_yaw=frame_yaw;c->orbit_camera_pitch=256;vita_dialogue_input(c,false,false,0,false);
+ if(now-status_at>=300){status_at=now;f=fopen("/research/scripts/TEMPLE_CLIENT_STATE.txt","w");if(f){fprintf(f,"%d %d %d %d %d %d %d\n",executed,px,pz,c->currentLevel,c->chat_interface_id,c->viewport_interface_id,bump_allocator_used());fclose(f);}}
+ static uint64_t ui474_status=0;if(now-ui474_status>250){ui474_status=now;FILE*uf=fopen("/research/scripts/UI474_CLIENT_STATE.json","w");if(uf){fprintf(uf,"{\"profile474\":%d,\"tab\":%d,\"primary\":%d,\"brightness\":%d,\"music\":%d,\"sounds\":%d,\"mouse\":%d,\"energy\":%d,\"inventory\":[",ui474_enabled(),c->selected_tab,c->local_player->pathing_entity.primarySeqId,c->varps[166],c->varps[168],c->varps[169],c->varps[170],c->energy);for(int i=0;i<28;i++){Component*q=_Component.instances[3214];fprintf(uf,"%s[%d,%d]",i?",":"",q->invSlotObjId[i]-1,q->invSlotObjCount[i]);}fprintf(uf,"],\"equipment\":[");for(int i=0;i<15;i++){Component*q=_Component.instances[1688];fprintf(uf,"%s[%d,%d]",i?",":"",q->invSlotObjId[i]-1,q->invSlotObjCount[i]);}fprintf(uf,"],\"base_skills\":[");for(int i=0;i<21;i++)fprintf(uf,"%s%d",i?",":"",c->skillBaseLevel[i]);fprintf(uf,"],\"client_varps\":[");for(int i=0;i<VARPS_COUNT;i++)fprintf(uf,"%s%d",i?",":"",c->varps[i]);fprintf(uf,"],\"focus_target\":%d,\"focus_kind\":%d,\"emote_scroll\":%d}",ui474_focus_target(),ui474_focus_kind(),ui474_scroll_position());fclose(uf);}}
+ static int coffin_seq=-999,coffin_frame=-999,coffin_secondary=-999;PathingEntity*ce=&c->local_player->pathing_entity;if(ce->primarySeqId!=coffin_seq||ce->primarySeqFrame!=coffin_frame||ce->secondarySeqId!=coffin_secondary){coffin_seq=ce->primarySeqId;coffin_frame=ce->primarySeqFrame;coffin_secondary=ce->secondarySeqId;FILE*cf=fopen("/research/scripts/COFFIN_PLAYER_TRACE.jsonl","a");if(cf){fprintf(cf,"{\"ms\":%llu,\"primary\":%d,\"frame\":%d,\"secondary\":%d,\"secondary_frame\":%d,\"delay\":%d,\"gender\":%d,\"x\":%d,\"z\":%d,\"plane\":%d}\n",(unsigned long long)now,ce->primarySeqId,ce->primarySeqFrame,ce->secondarySeqId,ce->secondarySeqFrame,ce->primarySeqDelay,c->local_player->gender,px,pz,c->currentLevel);fclose(cf);}}
+
+ static int ns_type[8192], ns_primary[8192], ns_frame[8192], ns_secondary[8192], ns_secondary_frame[8192];
+ for(int ni=0;ni<c->npc_count;ni++){int id=c->npc_ids[ni];NpcEntity*n=c->npcs[id];if(id<0||id>=8192||!n||!n->type)continue;int type=(int)n->type->index;if(type<1031&&type!=1028)continue;PathingEntity*a=&n->pathing_entity;if(ns_type[id]!=type||ns_primary[id]!=a->primarySeqId||ns_frame[id]!=a->primarySeqFrame||ns_secondary[id]!=a->secondarySeqId||ns_secondary_frame[id]!=a->secondarySeqFrame){ns_type[id]=type;ns_primary[id]=a->primarySeqId;ns_frame[id]=a->primarySeqFrame;ns_secondary[id]=a->secondarySeqId;ns_secondary_frame[id]=a->secondarySeqFrame;FILE*f=fopen("/research/scripts/NATURE_NPC_FRAME_TRACE.jsonl","a");if(f){fprintf(f,"{\"ms\":%llu,\"slot\":%d,\"type\":%d,\"primary\":%d,\"frame\":%d,\"secondary\":%d,\"secondary_frame\":%d,\"x\":%d,\"z\":%d,\"plane\":%d}\n",(unsigned long long)now,id,type,a->primarySeqId,a->primarySeqFrame,a->secondarySeqId,a->secondarySeqFrame,a->x/128+c->sceneBaseTileX,a->z/128+c->sceneBaseTileZ,c->currentLevel);fclose(f);}}}
+ {FILE*lf=fopen("/research/scripts/LAYOUTCORE_STATE.json","w");if(lf){fprintf(lf,"{\"generation\":%u,\"chat_scroll\":%d,\"chat_height\":%d,\"roles\":[",lc_game_generation(),c->chat_scroll_offset,c->chat_scroll_height);for(int i=0;i<LC_ROLES;i++){const LcGeometry*g=lc_game_geometry(i);fprintf(lf,"%s{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"clip\":[%d,%d,%d,%d]}",i?",":"",g->rect.x,g->rect.y,g->rect.w,g->rect.h,g->clip.x,g->clip.y,g->clip.w,g->clip.h);}fprintf(lf,"]}");fclose(lf);}}
+ Component*r=c->chat_interface_id>=0?_Component.instances[c->chat_interface_id]:NULL;
+ if(r){unsigned long hash=5381;hash=hash*33+c->vita_dialogue_generation;for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->text)for(const unsigned char*q=(const unsigned char*)t->text;*q;q++)hash=hash*33+*q;}
+  if(hash!=lastpage){lastpage=hash;page_at=now;rs2_log("TEMPLE_PAGE root=%d\n",r->id);for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->text&&t->text[0])rs2_log("TEMPLE_TEXT id=%d button=%d text=%s\n",t->id,t->buttonType,t->text);}}
+  if(now-page_at>=1300&&strcmp(wanted,"!hold")){int chosen=-1;bool choices=false;for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->buttonType==BUTTON_OK&&t->text&&t->text[0]){choices=true;if((!wanted[0]&&chosen<0)||!strcmp(wanted,"*first")||!strcmp(wanted,t->text)){chosen=t->id;break;}}}
+   if(choices&&chosen>=0){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<12&&c->vita_dialogue_selected!=chosen;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=chosen)abort();vita_dialogue_input(c,false,true,0,false);vita_dialogue_input(c,false,true,0,false);page_at=now;rs2_log("TEMPLE_CHOICE component=%d via=Dpad_Cross seq=%d\n",chosen,sequence);}
+   if(!choices){for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);vita_dialogue_input(c,false,true,0,false);page_at=now;rs2_log("TEMPLE_CONTINUE seq=%d duplicate-held-Cross-probe=1\n",sequence);break;}}}
+  }
+ }else lastpage=0;
+ if(kind&&sequence!=executed&&now-action_at>=1500&&(!r||kind==7||kind==12)){bool sent=false;
+  if(kind==1){int x=a-c->sceneBaseTileX,z=b-c->sceneBaseTileZ;if(x>=0&&x<104&&z>=0&&z<104){c->shell->action_key[5]=option?1:0;sent=client_try_move(c,c->local_player->pathing_entity.pathTileX[0],c->local_player->pathing_entity.pathTileZ[0],x,z,0,0,0,0,0,0,false);c->shell->action_key[5]=0;}}
+  else if(kind==2||kind==5){int best=-1,distance=0x7fffffff;for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==a){int dx=n->pathing_entity.pathTileX[0]-c->local_player->pathing_entity.pathTileX[0],dz=n->pathing_entity.pathTileZ[0]-c->local_player->pathing_entity.pathTileZ[0];int d=dx*dx+dz*dz;if(d<distance){best=id;distance=d;}}}
+   if(best>=0){if(kind==5){int slot=integration_inventory_slot(component,item);if(slot>=0){c->menu_action[0]=188;c->menuParamA[0]=item;c->menuParamB[0]=slot;c->menuParamC[0]=component;useMenuOption(c,0);c->menu_action[0]=900;c->menuParamA[0]=best;useMenuOption(c,0);sent=true;}}
+    else {int actions[]={728,542,6,963,245};if(option>=0&&option<5&&c->npcs[best]->type->op&&c->npcs[best]->type->op[option]){c->menu_action[0]=actions[option];c->menuParamA[0]=best;useMenuOption(c,0);sent=true;}}}}
+  else if(kind==3||kind==4){int x=b-c->sceneBaseTileX,z=zarg-c->sceneBaseTileZ;if(x>=0&&x<104&&z>=0&&z<104){int bits[]={world3d_get_locbitset(c->scene,c->currentLevel,x,z),world3d_get_wallbitset(c->scene,c->currentLevel,x,z),world3d_get_walldecorationbitset(c->scene,c->currentLevel,x,z),world3d_get_grounddecorationbitset(c->scene,c->currentLevel,x,z)};int bit=0;for(int i=0;i<4;i++)if(bits[i]&&((bits[i]>>14)&0x7fff)==a){bit=bits[i];break;}
+   if(bit){if(kind==4){int slot=integration_inventory_slot(component,item);if(slot>=0){c->menu_action[0]=188;c->menuParamA[0]=item;c->menuParamB[0]=slot;c->menuParamC[0]=component;useMenuOption(c,0);c->menu_action[0]=450;sent=true;}}
+    else{int actions[]={285,504,364,581,1501};LocType*l=loctype_get(a);if(option>=0&&option<5&&l&&l->op&&l->op[option]){c->menu_action[0]=actions[option];sent=true;}}
+    if(sent){c->menuParamA[0]=bit;c->menuParamB[0]=x;c->menuParamC[0]=z;useMenuOption(c,0);}}}}
+  else if(kind==6){int x=b-c->sceneBaseTileX,z=zarg-c->sceneBaseTileZ;if(x>=0&&x<104&&z>=0&&z<104){c->menu_action[0]=99;c->menuParamA[0]=a;c->menuParamB[0]=x;c->menuParamC[0]=z;useMenuOption(c,0);sent=true;}}
+  else if(kind==7){c->menu_action[0]=947;useMenuOption(c,0);sent=true;}
+  else if(kind==8){c->menu_action[0]=465;c->menuParamC[0]=a;useMenuOption(c,0);sent=true;}
+  else if(kind==16){sent=lc_game_parent(a,b);if(sent){c->redraw_background=c->redraw_sidebar=c->redraw_sideicons=c->redraw_chatback=c->redraw_privacy_settings=true;rs2_log("LAYOUTCORE_PARENT seq=%d width=%d height=%d generation=%u\n",sequence,a,b,lc_game_generation());}}
+  else if(kind==18){frame_yaw=a&2047;c->orbit_camera_yaw=frame_yaw;sent=true;rs2_log("FRAME_CAMERA seq=%d yaw=%d\n",sequence,c->orbit_camera_yaw);}
+  else if(kind==17){c->shell->mouse_x=a;c->shell->mouse_y=b;c->drag_cycles=zarg>0?zarg:1;int old=c->chat_scroll_offset;c->chat_interface->scrollPosition=c->chat_scroll_height-old-77;client_handle_scroll_input(c,a-(ve_enabled()?ve_chat_text_x():lc_x(LC_CHAT,22)),b-(ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))),c->chat_scroll_height,77,false,lc_chat_text_right(CHAT_TEXT_RIGHT),0,c->chat_interface);int next=c->chat_scroll_height-c->chat_interface->scrollPosition-77;if(next<0)next=0;if(next>c->chat_scroll_height-77)next=c->chat_scroll_height-77;c->chat_scroll_offset=next;c->redraw_chatback=true;c->drag_cycles=0;sent=true;rs2_log("LAYOUTCORE_CHAT_SCROLL seq=%d old=%d new=%d height=%d x=%d y=%d\n",sequence,old,next,c->chat_scroll_height,a,b);}
+  else if(kind==14){c->shell->mouse_x=a;c->shell->mouse_y=b;c->shell->mouse_click_x=a;c->shell->mouse_click_y=b;c->shell->mouse_click_button=option?option:1;client_handle_input(c);handleMouseInput(c);handleTabInput(c);handleMinimapInput(c);handleChatSettingsInput(c);c->shell->mouse_click_button=0;sent=true;rs2_log("UI474_POINTER x=%d y=%d button=%d tab=%d profile474=%d\n",a,b,option?option:1,c->selected_tab,ui474_enabled());}
+  else if(kind==15){int startpos=c->out->pos;vita_dialogue_input(c,false,false,0,false);bool first=false,held=false;for(int n=0;n<(zarg>0?zarg:1);n++)first=vita_dialogue_input(c,false,b!=0,a,false);if(b>1)held=vita_dialogue_input(c,false,true,0,false);sent=true;rs2_log("UI474_CONTROLLER seq=%d direction=%d confirms=%d repeat=%d tab=%d profile474=%d bytes=%d first_consumed=%d held_consumed=%d focus_target=%d focus_kind=%d\n",sequence,a,b,zarg>0?zarg:1,c->selected_tab,ui474_enabled(),c->out->pos-startpos,first,held,ui474_focus_target(),ui474_focus_kind());}
+  else if(kind==12){vita_dialogue_input(c,false,false,0,false);vita_dialogue_input(c,false,true,0,false);sent=true;}
+  else if(kind==11){int slot=integration_inventory_slot(component,a);int actions[]={405,38,422,478,347};ObjType*o=objtype_get(a);if(slot>=0&&option>=0&&option<5&&o&&o->iop&&o->iop[option]){c->menu_action[0]=actions[option];c->menuParamA[0]=a;c->menuParamB[0]=slot;c->menuParamC[0]=component;useMenuOption(c,0);sent=true;}}
+  else if(kind==9||kind==10){int slot=integration_inventory_slot(component,a);if(slot>=0&&option>=0&&option<5){int bank_actions[]={602,596,22,892,415};if(kind==10&&(!_Component.instances[component]->iops||!_Component.instances[component]->iops[option]))abort();c->menu_action[0]=kind==9?38:bank_actions[option];c->menuParamA[0]=a;c->menuParamB[0]=slot;c->menuParamC[0]=component;useMenuOption(c,0);sent=true;}}
+  action_at=now;if(sent){executed=sequence;rs2_log("TEMPLE_EXEC seq=%d kind=%d target=%d args=%d,%d option=%d item=%d component=%d pos=%d,%d,%d\n",sequence,kind,a,b,zarg,option,item,component,px,pz,c->currentLevel);}else rs2_log("TEMPLE_WAIT seq=%d kind=%d target=%d pos=%d,%d,%d\n",sequence,kind,a,px,pz,c->currentLevel);
+ }
+ return;}
+if(getenv("TZHAAR_RECONNECT")){static uint64_t last=0;uint64_t now=rs2_now();if(now-last>2000){last=now;int px=c->local_player->pathing_entity.x/128+c->sceneBaseTileX,pz=c->local_player->pathing_entity.z/128+c->sceneBaseTileZ;rs2_log("TZHAAR_RECONNECT pos=%d,%d,%d pool=%d/%d\n",px,pz,c->currentLevel,bump_allocator_used(),bump_allocator_capacity());}return;}
+if(getenv("TZHAAR_TEST")){static int phase=0;static uint64_t last=0;uint64_t now=rs2_now();int px=c->local_player->pathing_entity.x/128+c->sceneBaseTileX,pz=c->local_player->pathing_entity.z/128+c->sceneBaseTileZ;c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+if(now-last<2200)return;last=now;rs2_log("TZHAAR_STATE phase=%d pos=%d,%d,%d base=%d,%d pool=%d/%d\n",phase,px,pz,c->currentLevel,c->sceneBaseTileX,c->sceneBaseTileZ,bump_allocator_used(),bump_allocator_capacity());
+int ox=-1,oz=-1,expect=-1;
+if(phase==0){ox=2856;oz=3168;expect=492;}
+else if(phase==1&&pz>9000){ox=2863;oz=9571;expect=3405;}
+else if(phase==2&&pz<6000){bool wall=client_try_move(c,c->local_player->pathing_entity.pathTileX[0],c->local_player->pathing_entity.pathTileZ[0],2430-c->sceneBaseTileX,5165-c->sceneBaseTileZ,0,0,0,0,0,0,false);rs2_log("TZHAAR_BLOCKED_TILE rejected=%d\n",!wall);if(wall)abort();phase++;}
+else if(phase==3||phase==4||phase==5){const int route[3][2]={{2428,5174},{2460,5158},{2480,5175}};int tx=route[phase-3][0],tz=route[phase-3][1];if(px==tx&&pz==tz){rs2_log("TZHAAR_WAYPOINT_REACHED phase=%d x=%d z=%d\n",phase,px,pz);phase++;}else{bool ok=client_try_move(c,c->local_player->pathing_entity.pathTileX[0],c->local_player->pathing_entity.pathTileZ[0],tx-c->sceneBaseTileX,tz-c->sceneBaseTileZ,0,0,0,0,0,0,false);rs2_log("TZHAAR_WALK phase=%d target=%d,%d success=%d\n",phase,tx,tz,ok);}}
+else if(phase==6){ox=2479;oz=5176;expect=3406;}
+else if(phase==7&&pz>9000){ox=2856;oz=9569;expect=1764;}
+else if(phase==8&&pz<4000){rs2_log("TZHAAR_LOOP_COMPLETE pos=%d,%d,%d\n",px,pz,c->currentLevel);phase++;}
+if(expect>=0){int x=ox-c->sceneBaseTileX,z=oz-c->sceneBaseTileZ;int bit=world3d_get_locbitset(c->scene,c->currentLevel,x,z);if(!bit)bit=world3d_get_wallbitset(c->scene,c->currentLevel,x,z);int found=(bit>>14)&0x7fff;rs2_log("TZHAAR_OBJECT expected=%d actual=%d at=%d,%d\n",expect,found,ox,oz);if(found==expect){c->menu_action[0]=285;c->menuParamA[0]=bit;c->menuParamB[0]=x;c->menuParamC[0]=z;useMenuOption(c,0);phase++;}}
+return;}
+if(getenv("BANK_NETWORK_TEST")){static int phase=0;static uint64_t last=0;uint64_t now=rs2_now();if(now-last<1400)return;last=now;int cape=2920,hood=2922,slot=-1;
+#define BANK_ACTION(act,ob,sl,co) do{c->menu_action[0]=(act);c->menuParamA[0]=(ob);c->menuParamB[0]=(sl);c->menuParamC[0]=(co);useMenuOption(c,0);}while(0)
+if(phase==0&&(slot=integration_inventory_slot(1688,cape))>=0){c->selected_tab=4;c->redraw_sidebar=true;BANK_ACTION(602,cape,slot,1688);phase++;rs2_log("BANK_NETWORK removed cape via original equipment action\n");}
+else if(phase==1&&(slot=integration_inventory_slot(1688,hood))>=0){BANK_ACTION(602,hood,slot,1688);phase++;rs2_log("BANK_NETWORK removed hood\n");}
+else if(phase==2&&integration_inventory_slot(3214,cape)>=0&&integration_inventory_slot(3214,hood)>=0){int x=atoi(getenv("BANK_X"))-c->sceneBaseTileX,z=atoi(getenv("BANK_Z"))-c->sceneBaseTileZ;int bit=world3d_get_locbitset(c->scene,c->currentLevel,x,z);if(((bit>>14)&0x7fff)!=2213)abort();BANK_ACTION(504,bit,x,z);phase++;rs2_log("BANK_NETWORK original OPLOC2 bankbooth=2213\n");}
+else if(phase==3&&c->viewport_interface_id==5292&&(slot=integration_inventory_slot(2006,cape))>=0){BANK_ACTION(602,cape,slot,2006);phase++;rs2_log("BANK_NETWORK deposit cape\n");}
+else if(phase==4&&integration_inventory_slot(5382,cape)>=0&&(slot=integration_inventory_slot(2006,hood))>=0){BANK_ACTION(602,hood,slot,2006);phase++;rs2_log("BANK_NETWORK deposit hood\n");}
+else if(phase==5&&integration_inventory_slot(5382,hood)>=0&&(slot=integration_inventory_slot(5382,cape))>=0){BANK_ACTION(602,cape,slot,5382);phase++;rs2_log("BANK_NETWORK withdraw cape\n");}
+else if(phase==6&&integration_inventory_slot(2006,cape)>=0&&integration_inventory_slot(5382,cape)<0&&(slot=integration_inventory_slot(5382,hood))>=0){BANK_ACTION(602,hood,slot,5382);phase++;rs2_log("BANK_NETWORK withdraw hood\n");}
+else if(phase==7&&integration_inventory_slot(2006,hood)>=0&&integration_inventory_slot(5382,hood)<0){BANK_ACTION(947,0,0,0);phase++;rs2_log("BANK_NETWORK close through original action\n");}
+else if(phase==8&&c->viewport_interface_id<0&&(slot=integration_inventory_slot(3214,cape))>=0){BANK_ACTION(38,cape,slot,3214);phase++;}
+else if(phase==9&&c->local_player->appearances[1]==3432&&(slot=integration_inventory_slot(3214,hood))>=0){BANK_ACTION(38,hood,slot,3214);phase++;}
+else if(phase==10&&c->local_player->appearances[0]==3434){phase++;rs2_log("BANK_NETWORK_COMPLETE cape=%d hood=%d\n",c->local_player->appearances[1],c->local_player->appearances[0]);}
+#undef BANK_ACTION
+return;}
+if(getenv("WIDTH_REVIEW")){static uint64_t changed=0;static unsigned long prev=0;static int seq=0,acted=0,logged=0;uint64_t now=rs2_now();unsigned long hash=5381;Component*r=c->chat_interface_id>=0?_Component.instances[c->chat_interface_id]:NULL;if(r){hash=hash*33+c->chat_interface_id;for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];for(const unsigned char*q=(const unsigned char*)t->text;*q;q++)hash=hash*33+*q;}}else hash=0;
+if(r)hash=hash*33+c->vita_dialogue_generation;
+if(hash&&hash!=prev){prev=hash;changed=now;acted=0;logged=0;}if(r&&!logged&&now-changed>700){logged=1;seq++;vita_dialogue_input(c,false,false,0,false);rs2_log("WIDTH_PAGE seq=%d root=%d width=%d\n",seq,c->chat_interface_id,r->width);for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];rs2_log("WIDTH_COMPONENT seq=%d id=%d type=%d button=%d x=%d y=%d width=%d height=%d text=%s\n",seq,t->id,t->type,t->buttonType,r->childX[j],r->childY[j],t->width,t->height,t->text);}}
+if(r&&!acted&&now-changed>2600){int count=0,first=-1;for(int j=0;j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t->type==4&&t->buttonType==1){if(first<0)first=t->id;count++;}}if(count){for(int j=0;j<count;j++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=first)abort();for(int j=0;j<count;j++)vita_dialogue_input(c,false,false,-1,false);if(c->vita_dialogue_selected!=first)abort();rs2_log("WIDTH_NAV seq=%d count=%d wrapped_both_directions=1\n",seq,count);}vita_dialogue_input(c,false,true,0,false);vita_dialogue_input(c,false,true,0,false);rs2_log("WIDTH_CONFIRM seq=%d duplicate_continue_guard=%d\n",seq,c->pressed_continue_option);acted=1;}if(!r)prev=0;c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;return;}
+if(getenv("FISH_PLACEMENT_ONLY")){c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;return;}
+if(getenv("FISH_GUILD_TEST")){static uint64_t began=0,last=0;static int clicked=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;if(!clicked&&sec>=3){int x=2611-c->sceneBaseTileX,z=3394-c->sceneBaseTileZ;int bit=world3d_get_wallbitset(c->scene,c->currentLevel,x,z);if(!bit)bit=world3d_get_locbitset(c->scene,c->currentLevel,x,z);if(((bit>>14)&0x7fff)!=2025)abort();c->menu_action[0]=285;c->menuParamA[0]=bit;c->menuParamB[0]=x;c->menuParamC[0]=z;useMenuOption(c,0);clicked=1;rs2_log("FISH_GUILD original OPLOC1 type=%d at=%d,%d\n",2025,2611,3394);}if(c->chat_interface_id>=0&&now-last>1600){last=now;Component*root=_Component.instances[c->chat_interface_id];for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("FISH_GUILD TEXT %s\n",t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);break;}}}if(game_frames%100==0)rs2_log("FISH_GUILD sec=%d pos=%d,%d\n",sec,c->local_player->pathing_entity.x/128+c->sceneBaseTileX,c->local_player->pathing_entity.z/128+c->sceneBaseTileZ);return;}
+if(getenv("HERBLORE_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("HERB_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==455){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("HERB normal Talk-to target=455 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk to Kaqemeex.":"I'd like to buy a Herblore cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");if(getenv("CRAFT_ORIGINAL")&&phase>=2)wanted="Very well, thank you.";bool acted=false;if(getenv("HERB_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((phase==1&&!strcmp(t->text,"I'd like to buy a Herblore cape.")&&sec<8)||(phase>=2&&!strcmp(t->text,"Buy the cape and hood for 99,000 coins.")))){rs2_log("HERB_PREVIEW_READY stage=%s\n",phase==1?"initial":"choices");return;}}}
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);if(getenv("HERBLORE_REPLAY_PROBE")&&strstr(wanted,"Buy the cape")){for(int k=0;k<5;k++)client_vita_dialogue_action(c,t->id,951);rs2_log("HERB_NETWORK_REPLAY sent5 stale purchase buttons\n");}rs2_log("HERB D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("HERB_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(!t)continue;const char*stage=NULL;if(strstr(t->text,"You have mastered Herblore")&&sec<18)stage="eligible";else if(strstr(t->text,"mastered another skill")&&sec<28)stage="trim";else if(strstr(t->text,"When you reach level 99 Herblore"))stage="lowlevel";if(stage){rs2_log("HERB_PREVIEW_READY stage=%s\n",stage);return;}}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("HERB TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("HERB Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2918:2917;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("HERB normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2920){c->menu_action[0]=38;c->menuParamA[0]=2919;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("HERB normal Wear hood=2919\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("HERB sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("RUNECRAFTING_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("RUNE_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ if(getenv("CRAFT_ORIGINAL")&&c->viewport_interface_id==3824){static int shoplogged=0;if(!shoplogged){rs2_log("RUNE_ORIGINAL_SHOP_OPEN id=3824\n");shoplogged=1;}}
+if(getenv("RUNE_ESSENCE")){static int entered=0,portalclicked=0;int px=c->local_player->pathing_entity.x/128+c->sceneBaseTileX,pz=c->local_player->pathing_entity.z/128+c->sceneBaseTileZ;if(pz>4500){entered=1;if(!portalclicked)for(int x=0;x<104;x++)for(int z=0;z<104;z++){int bit=world3d_get_locbitset(c->scene,c->currentLevel,x,z);if(bit&&!portalclicked&&((bit>>14)&0x7fff)==2492){c->menu_action[0]=285;c->menuParamA[0]=bit;c->menuParamB[0]=x;c->menuParamC[0]=z;useMenuOption(c,0);rs2_log("RUNE_ESSENCE normal portal action type=2492 at=%d,%d\n",x+c->sceneBaseTileX,z+c->sceneBaseTileZ);portalclicked=1;}}return;}if(entered&&pz<4000){rs2_log("RUNE_ESSENCE_LOOP_COMPLETE pos=%d,%d,%d\n",px,pz,c->currentLevel);return;}}
+static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==553){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("RUNE normal Talk-to target=553 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk to Aubury.":"I'd like to buy a Runecrafting cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");if(getenv("CRAFT_ORIGINAL")&&phase>=2)wanted=getenv("RUNE_ESSENCE")?"Can you teleport me to the Rune Essence?":"Yes please!";bool acted=false;if(getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((phase==1&&!strcmp(t->text,"I'd like to buy a Runecrafting cape.")&&sec<8)||(phase>=2&&!strcmp(t->text,"Buy the cape and hood for 99,000 coins.")))){rs2_log("RUNE_PREVIEW_READY stage=%s\n",phase==1?"initial":"choices");return;}}}
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->buttonType==BUTTON_OK&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);if(getenv("RUNECRAFTING_REPLAY_PROBE")&&strstr(wanted,"Buy the cape")){for(int k=0;k<5;k++)client_vita_dialogue_action(c,t->id,951);rs2_log("RUNE_NETWORK_REPLAY sent5 stale purchase buttons\n");}rs2_log("RUNE D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(!t)continue;const char*stage=NULL;if(strstr(t->text,"You have mastered Runecrafting")&&sec<18)stage="eligible";else if(strstr(t->text,"mastered another skill")&&sec<28)stage="trim";else if(strstr(t->text,"When you reach level 99 Runecrafting"))stage="lowlevel";if(stage){rs2_log("RUNE_PREVIEW_READY stage=%s\n",stage);return;}}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("RUNE TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("RUNE Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2921:2920;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2923){c->menu_action[0]=38;c->menuParamA[0]=2922;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear hood=2922\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("RUNE sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("HITPOINTS_TEST")){if(getenv("HP_DIRECT_HEAL")){static uint64_t start=0;static int sent=0;uint64_t now=rs2_now();if(!start)start=now;if(!sent&&now-start>2000){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==961){c->menu_size=0;addNpcOptions(c,n->type,id,n->pathing_entity.pathTileX[0],n->pathing_entity.pathTileZ[0]);for(int j=0;j<c->menu_size;j++)if(!strncmp(c->menu_option[j],"Heal ",5)){rs2_log("HP_DIRECT_HEAL normal context action=%d\n",c->menu_action[j]);useMenuOption(c,j);sent=1;break;}break;}}}return;}
+if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("RUNE_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==961){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("RUNE normal Talk-to target=961 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk to Tafani.":"I'd like to buy a Hitpoints cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");if(getenv("CRAFT_ORIGINAL")&&phase>=2)wanted="Can you heal me?";bool acted=false;if(getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((phase==1&&!strcmp(t->text,"I'd like to buy a Hitpoints cape.")&&sec<8)||(phase>=2&&!strcmp(t->text,"Buy the cape and hood for 99,000 coins.")))){rs2_log("RUNE_PREVIEW_READY stage=%s\n",phase==1?"initial":"choices");return;}}}
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->buttonType==BUTTON_OK&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);if(getenv("HITPOINTS_REPLAY_PROBE")&&strstr(wanted,"Buy the cape")){for(int k=0;k<5;k++)client_vita_dialogue_action(c,t->id,951);rs2_log("RUNE_NETWORK_REPLAY sent5 stale purchase buttons\n");}rs2_log("RUNE D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(!t)continue;const char*stage=NULL;if(strstr(t->text,"You have mastered Hitpoints")&&sec<18)stage="eligible";else if(strstr(t->text,"mastered another skill")&&sec<28)stage="trim";else if(strstr(t->text,"When you reach level 99 Hitpoints"))stage="lowlevel";if(stage){rs2_log("RUNE_PREVIEW_READY stage=%s\n",stage);return;}}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("RUNE TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("RUNE Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2924:2923;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2926){c->menu_action[0]=38;c->menuParamA[0]=2925;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear hood=2925\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("RUNE sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("PRIESTPERIL_TEST")){static uint64_t began=0,last=0;static int phase=0,pages=0,done=0;uint64_t now=rs2_now();if(!began)began=now;c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;vita_dialogue_input(c,false,false,0,false);
+if(!phase&&now-began>1800){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==648){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("PIP_CONNECTED normal Talk-to existing King Roald\n");break;}}}
+if(phase&&c->chat_interface_id>=0&&now-last>650){last=now;Component*r=_Component.instances[c->chat_interface_id];if(getenv("PIP_DIALOGUE_PREVIEW")){for(int j=0;r&&j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->text&&strstr(t->text,"A quest you say?")){rs2_log("PIP_DIALOGUE_PREVIEW original Roald page held for capture\n");return;}}}bool acted=false;for(int j=0;r&&j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(!t||!t->text)continue;rs2_log("PIP_TEXT %s\n",t->text);if(t->buttonType==BUTTON_OK&&!strcmp(t->text,"Sure.")){vita_dialogue_input(c,false,false,0,false);int first=c->vita_dialogue_selected;vita_dialogue_input(c,false,false,1,false);vita_dialogue_input(c,false,false,-1,false);if(c->vita_dialogue_selected!=first)abort();for(int k=0;k<5&&c->vita_dialogue_selected!=t->id;k++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);vita_dialogue_input(c,false,true,0,false);phase=2;acted=true;rs2_log("PIP_CONNECTED D-pad and Cross accepted original Sure choice\n");break;}}
+if(!acted)for(int j=0;r&&j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);pages++;rs2_log("PIP_CONNECTED continue page=%d\n",pages);break;}}}
+if(phase==2&&c->chat_interface_id<0&&!done&&now-began>18000){client_vita_dialogue_action(c,7630,951);done=1;rs2_log("PIP_CONNECTED original IF_BUTTON requested new Journal entry\n");}return;}
+if(getenv("PRIESTPERIL_JOURNAL_REVIEW")){static uint64_t began=0;static int sent=0;uint64_t now=rs2_now();if(!began)began=now;if(now-began>2000){for(int tab=0;tab<14;tab++)if(c->tab_interface_id[tab]==638){c->selected_tab=tab;c->redraw_sideicons=true;c->redraw_sidebar=true;break;}Component*p=_Component.instances[639];p->scrollPosition=p->scroll-p->height;c->redraw_sidebar=true;}if(now-began>9000&&!sent){client_vita_dialogue_action(c,7630,951);sent=1;rs2_log("PIP_JOURNAL original button requested\n");}return;}
+if(getenv("MINING_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("RUNE_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2&&getenv("GADRIN_NAME_PROBE")){
+ if(strcmp(npctype_get(1020)->name,"Gadrin")||strcmp(npctype_get(382)->name,"Dwarf"))abort();
+ for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==1020&&sec<8){
+ c->menu_size=1;strcpy(c->menu_option[0],"Cancel");c->menu_action[0]=1252;addNpcOptions(c,n->type,id,0,0);
+ bool talk=false,examine=false;for(int j=1;j<c->menu_size;j++){rs2_log("GADRIN_MENU %s\n",c->menu_option[j]);if(strstr(c->menu_option[j],"Talk-to")&&strstr(c->menu_option[j],"Gadrin"))talk=true;if(strstr(c->menu_option[j],"Examine")&&strstr(c->menu_option[j],"Gadrin"))examine=true;}if(!talk||!examine)abort();
+ c->menu_visible=true;c->menu_area=0;c->menu_x=310;c->menu_y=170;c->menu_width=230;c->menu_height=c->menu_size*15+22;rs2_log("RUNE_PREVIEW_READY stage=menu\n");return;}}
+ c->menu_visible=false;
+}
+if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==1020){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("RUNE normal Talk-to target=1020 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk about the Mining Guild.":"I'd like to buy a Mining cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");if(getenv("CRAFT_ORIGINAL")&&phase>=2)wanted="No thanks, I'm fine.";bool acted=false;if(getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((phase==1&&!strcmp(t->text,"I'd like to buy a Mining cape.")&&sec<14)||(phase>=2&&!strcmp(t->text,"Buy the cape and hood for 99,000 coins.")))){rs2_log("RUNE_PREVIEW_READY stage=%s\n",phase==1?"initial":"choices");return;}}}
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->buttonType==BUTTON_OK&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);if(getenv("MINING_REPLAY_PROBE")&&strstr(wanted,"Buy the cape")){for(int k=0;k<5;k++)client_vita_dialogue_action(c,t->id,951);rs2_log("RUNE_NETWORK_REPLAY sent5 stale purchase buttons\n");}rs2_log("RUNE D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("RUNE_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(!t)continue;const char*stage=NULL;if(strstr(t->text,"You have mastered Mining")&&sec<24)stage="eligible";else if(strstr(t->text,"mastered another skill")&&sec<34)stage="trim";else if(strstr(t->text,"When you reach level 99 Mining"))stage="lowlevel";if(stage){rs2_log("RUNE_PREVIEW_READY stage=%s\n",stage);return;}}}
+if(!acted&&getenv("GADRIN_ORIGINAL")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&strstr(t->text,"Welcome to the Mining Guild")&&sec<24){rs2_log("RUNE_PREVIEW_READY stage=original\n");return;}}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("RUNE TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("RUNE Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2927:2926;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2929){c->menu_action[0]=38;c->menuParamA[0]=2928;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RUNE normal Wear hood=2928\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("RUNE sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("FISHING_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("FISH_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==308){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("FISH normal Talk-to target=308 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk about the Fishing Guild.":"I'd like to buy a Fishing cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");bool acted=false;if(getenv("FISH_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((phase==1&&!strcmp(t->text,"I'd like to buy a Fishing cape.")&&sec<8)||(phase>=2&&!strcmp(t->text,"Buy the cape and hood for 99,000 coins.")))){rs2_log("FISH_PREVIEW_READY stage=%s\n",phase==1?"initial":"choices");return;}}}
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);if(getenv("FISHING_REPLAY_PROBE")&&strstr(wanted,"Buy the cape")){for(int k=0;k<5;k++)client_vita_dialogue_action(c,t->id,951);rs2_log("FISH_NETWORK_REPLAY sent5 stale purchase buttons\n");}rs2_log("FISH D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("FISH_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(!t)continue;const char*stage=NULL;if(strstr(t->text,"You have mastered Fishing")&&sec<18)stage="eligible";else if(strstr(t->text,"mastered another skill")&&sec<28)stage="trim";else if(strstr(t->text,"When you reach level 99 Fishing"))stage="lowlevel";if(stage){rs2_log("FISH_PREVIEW_READY stage=%s\n",stage);return;}}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("FISH TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("FISH Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2915:2914;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("FISH normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2917){c->menu_action[0]=38;c->menuParamA[0]=2916;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("FISH normal Wear hood=2916\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("FISH sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("SMITHING_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("SMITH_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==604){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("SMITH normal Talk-to target=604 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Talk to Thurgo.":"I'd like to buy a Smithing cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");bool acted=false;
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);rs2_log("SMITH D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("SMITH_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((strstr(t->text,"You have mastered Smithing")&&sec<12)||strstr(t->text,"mastered another skill")||strstr(t->text,"When you reach level 99 Smithing")))return;}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("SMITH TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("SMITH Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2912:2911;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("SMITH normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2914){c->menu_action[0]=38;c->menuParamA[0]=2913;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("SMITH normal Wear hood=2913\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("SMITH sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("CRAFTING_TEST")){if(getenv("RELOGIN_ONLY")){if(game_frames%100==0){int coins=0;Component*v=_Component.instances[3214];for(int i=0;i<v->width*v->height;i++)if(v->invSlotObjId[i]==996)coins+=v->invSlotObjCount[i];rs2_log("CRAFT_RELOGIN cape=%d hood=%d coins=%d\n",c->local_player->appearances[1],c->local_player->appearances[0],coins);}return;}
+ static uint64_t began=0,last=0;static int phase=0,done=0;uint64_t now=rs2_now();if(!began)began=now;int sec=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ if(!phase&&sec>=2){for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==805){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);phase=1;rs2_log("CRAFT normal Talk-to target=805 sec=%d\n",sec);break;}}}
+ if(phase&&c->chat_interface_id>=0&&now-last>=1600){last=now;Component*root=_Component.instances[c->chat_interface_id];const char*wanted=phase==1?(getenv("CRAFT_ORIGINAL")?"Hello.":"I'd like to buy a Crafting cape."):(getenv("RANGE_DECLINE")?"No thank you.":"Buy the cape and hood for 99,000 coins.");bool acted=false;
+ for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<5&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);rs2_log("CRAFT D-pad Cross phase=%d text=%s colour=%06x\n",phase,wanted,vita_interface_text_colour(c,t->id,t->colour));phase++;acted=true;break;}}
+ if(!acted&&getenv("CRAFT_PREVIEW")){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&((strstr(t->text,"You have mastered Crafting")&&sec<12)||strstr(t->text,"mastered another skill")||strstr(t->text,"When you reach level 99 Crafting")))return;}}
+if(!acted)for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0])rs2_log("CRAFT TEXT phase=%d %s\n",phase,t->text);if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("CRAFT Cross continue sec=%d\n",sec);break;}}
+ }
+ if(phase>=2&&c->chat_interface_id<0&&!done&&sec>16){Component*inv=_Component.instances[3214];int cape=getenv("MASTER_TRIM")?2909:2908;for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==cape+1){c->menu_action[0]=38;c->menuParamA[0]=cape;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("CRAFT normal Wear cape=%d\n",cape);break;}done=1;}
+ if(done==1&&sec>20){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2911){c->menu_action[0]=38;c->menuParamA[0]=2910;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("CRAFT normal Wear hood=2910\n");break;}done=2;}
+ if(game_frames%100==0)rs2_log("CRAFT sec=%d phase=%d cape=%d head=%d latest=%s\n",sec,phase,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);return;
+}
+if(getenv("TUTOR_PLACEMENT_PREVIEW")){
+ static uint64_t began=0,lastAction=0,opened=0;static int round=0,active=0,entry=0;uint64_t now=rs2_now();if(!began)began=now;int seconds=(now-began)/1000;
+ c->orbit_camera_yaw=512;c->orbit_camera_pitch=256;
+ int types[]={1017,1018,1019,1017,1018,1019};int starts[]={12,70,130,190,250,310};
+ if(round<6&&!active&&seconds>=starts[round]){int found=-1;for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==types[round]){found=id;break;}}if(found>=0){c->menu_action[0]=728;c->menuParamA[0]=found;useMenuOption(c,0);rs2_log("OBS_TALK_REQUEST round=%d type=%d sec=%d\n",round,types[round],seconds);active=1;entry=0;opened=0;lastAction=now;}}
+ if(active&&c->chat_interface_id>=0){if(!opened){opened=now;rs2_log("OBS_DIALOGUE_OPEN round=%d root=%d sec=%d\n",round,c->chat_interface_id,seconds);}if(now-opened>=8000&&now-lastAction>=1000){lastAction=now;Component*root=_Component.instances[c->chat_interface_id];bool acted=false;const char*wanted=round==3?(entry?"Buy the cape and hood for 99,000 coins.":"I'd like to buy a Defence cape."):"Goodbye.";for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->text[0]&&!strcmp(t->text,wanted)){vita_dialogue_input(c,false,false,0,false);for(int n=0;n<10&&c->vita_dialogue_selected!=t->id;n++)vita_dialogue_input(c,false,false,1,false);if(c->vita_dialogue_selected!=t->id)abort();vita_dialogue_input(c,false,true,0,false);rs2_log("OBS_CONTROLLER_CHOICE round=%d text=%s\n",round,wanted);entry++;acted=true;break;}}
+ if(!acted){for(int j=0;root&&j<root->childCount;j++){Component*t=_Component.instances[root->childId[j]];if(t&&t->buttonType==BUTTON_CONTINUE){vita_dialogue_input(c,false,true,0,false);rs2_log("OBS_CONTROLLER_CONTINUE round=%d sec=%d\n",round,seconds);break;}}}}}
+ if(active&&opened&&c->chat_interface_id<0&&now-opened>8500){int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];bool ok=client_try_move(c,sx,sz,3223-c->sceneBaseTileX,3236-c->sceneBaseTileZ,0,0,0,0,0,0,true);rs2_log("OBS_DIALOGUE_COMPLETE round=%d depart_walk=%d sec=%d\n",round,ok,seconds);active=0;round++;}
+ if(game_frames%50==0){for(int i=0;i<c->npc_count;i++){NpcEntity*n=c->npcs[c->npc_ids[i]];if(n&&n->type&&n->type->index>=1017&&n->type->index<=1019)rs2_log("OBS_CLIENT_NPC sec=%d type=%lld seq=%d frame=%d\n",seconds,(long long)n->type->index,n->pathing_entity.secondarySeqId,n->pathing_entity.secondarySeqFrame);}}
+ return;
+}
+    if(getenv("RELOGIN_ONLY")){if(game_frames%100==0)rs2_log("RELOGIN frame=%d cape=%d head=%d player=%s\n",game_frames,c->local_player->appearances[1],c->local_player->appearances[0],c->local_player->name);return;}
+    if(getenv("MULTI_FIRE")){
+        if(game_frames%200==100){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2890){c->menu_action[0]=38;c->menuParamA[0]=2889;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);break;}}
+        if(game_frames%200==0 && game_frames>0 && game_frames<2000){Component*w=_Component.instances[1688];if(w->invSlotObjId[1]==2890){c->menu_action[0]=602;c->menuParamA[0]=2889;c->menuParamB[0]=1;c->menuParamC[0]=1688;useMenuOption(c,0);}}
+        c->shell->action_key[2]=(game_frames>=400&&game_frames<800)?1:0;
+        if(game_frames%100==0){int fire=c->local_player->appearances[1]==3401?1:0;for(int i=0;i<c->player_count;i++){PlayerEntity*p=c->players[c->player_ids[i]];if(p&&p->appearances[1]==3401)fire++;}rs2_log("MULTI frame=%d visible_fire=%d own_cape=%d players=%d\n",game_frames,fire,c->local_player->appearances[1],c->player_count);}
+        return;
+    }
+    if(getenv("MASTER_TEST")) {
+        if(game_frames==100){int found=-1;for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->name&&strcmp(n->type->name,"Melee combat tutor")==0){found=id;break;}}if(found>=0){c->menu_action[0]=728;c->menuParamA[0]=found;useMenuOption(c,0);rs2_log("MASTER normal NPC Talk-to slot=%d type=%lld\n",found,(long long)c->npcs[found]->type->index);}else rs2_log("MASTER NPC unavailable\n");}
+        static int master_accepted=0,master_entry=0;static int logged_root=-2;
+        if(getenv("HARLAN_REPEAT") && game_frames==1300){master_accepted=0;master_entry=0;for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(n&&n->type&&n->type->index==1017){c->menu_action[0]=728;c->menuParamA[0]=id;useMenuOption(c,0);rs2_log("HARLAN fresh paid repeat normal Talk-to\n");break;}}}
+        if(getenv("HARLAN_REPEAT") && (game_frames==2300||game_frames==2500)){int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];bool run=game_frames==2500;c->shell->action_key[5]=run?1:0;bool moved=client_try_move(c,sx,sz,sx+3,sz,0,0,0,0,0,0,true);c->shell->action_key[5]=0;rs2_log("HARLAN normal movement run=%d accepted=%d\n",run,moved);}
+        if(getenv("HARLAN_REPEAT"))c->shell->action_key[2]=(game_frames>=2400&&game_frames<2480)?1:0;
+
+ if(c->chat_interface_id!=logged_root){logged_root=c->chat_interface_id;if(logged_root>=0){Component*r=_Component.instances[logged_root];for(int j=0;r&&j<r->childCount;j++){Component*t=_Component.instances[r->childId[j]];if(t&&t->text&&t->text[0])rs2_log("LIVE_DIALOGUE root=%d id=%d button=%d text=%s\n",logged_root,t->id,t->buttonType,t->text);}}}
+
+        if(game_frames>140 && game_frames%70==0 && c->chat_interface_id>=0){Component*root=_Component.instances[c->chat_interface_id];if(root&&root->childId){for(int i=0;i<root->childCount;i++){int id=root->childId[i];if(id<0||id>=_Component.count)continue;Component*com=_Component.instances[id];if(!com||com->hide)continue;if(id==2484&&!master_entry){
+ int option=getenv("RANGE_SHOP")?0:getenv("RANGE_FAREWELL")?1:2;
+ vita_dialogue_input(c,false,false,0,false);int first=c->vita_dialogue_selected;
+ for(int step=0;step<4;step++)vita_dialogue_input(c,false,false,1,false);
+ if(c->vita_dialogue_selected!=first){rs2_error("TEST: four-choice wrap failed\n");abort();}
+ for(int step=0;step<option;step++)vita_dialogue_input(c,false,false,1,false);
+ int selected=c->vita_dialogue_selected;
+ if(selected!=2482+option){rs2_error("TEST: original choice order changed\n");abort();}
+ rs2_log("HARLAN production D-pad option=%d component=%d colour=%06x\n",option+1,selected,vita_interface_text_colour(c,selected,_Component.instances[selected]->colour));
+ vita_dialogue_input(c,false,true,0,false);master_entry=1;break;}
+ if(getenv("RANGE_ADVICE")&&id==2472&&master_entry==1){
+ vita_dialogue_input(c,false,false,0,false);
+ if(getenv("RANGE_ACCESSORIES"))vita_dialogue_input(c,false,false,1,false);
+ rs2_log("HARLAN original advice production selection=%d\n",c->vita_dialogue_selected);
+ vita_dialogue_input(c,false,true,0,false);master_entry=2;break;}
+if(id==RESEARCH_MASTER_YES&&!master_accepted){c->menu_action[0]=951;c->menuParamC[0]=getenv("RANGE_DECLINE")?2462:id;useMenuOption(c,0);if(!getenv("RANGE_DECLINE"))useMenuOption(c,0);master_accepted=1;rs2_log("MASTER accept normal IF_BUTTON component=%d twice replay test frame=%d\n",id,game_frames);break;}if(com->buttonType==BUTTON_CONTINUE){
+if(getenv("APPROVED_DIALOGUE_PREVIEW")) {
+ bool approved_page=false;
+ for(int j=0;j<root->childCount;j++){int cid=root->childId[j];if(cid>=0&&cid<_Component.count){Component *t=_Component.instances[cid];if(t&&t->text&&strstr(t->text,"mastered another"))approved_page=true;}}
+ if(approved_page)break;
+}
+c->menu_action[0]=44;c->menuParamC[0]=id;useMenuOption(c,0);rs2_log("MASTER normal continuation component=%d frame=%d\n",id,game_frames);break;}}}}
+        if(game_frames==1000){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==(getenv("MASTER_TRIM")?2898:2897)){c->menu_action[0]=38;c->menuParamA[0]=getenv("MASTER_TRIM")?2897:2896;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("MASTER purchased cape normal Wear slot=%d\n",slot);break;}}
+        if(game_frames==1150){Component*inv=_Component.instances[3214];for(int slot=0;slot<inv->width*inv->height;slot++)if(inv->invSlotObjId[slot]==2899){c->menu_action[0]=38;c->menuParamA[0]=2898;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("MASTER purchased hood normal Wear slot=%d\n",slot);break;}}
+        if(game_frames%100==0)rs2_log("HARLAN_WINDOW main=%d\n",c->viewport_interface_id);
+        if(game_frames%100==0)rs2_log("MASTER frame=%d chat=%d cape=%d head=%d latest_message=%s\n",game_frames,c->chat_interface_id,c->local_player->appearances[1],c->local_player->appearances[0],c->message_text[0]);
+        return;
+    }
+    if (game_frames==100 || (game_frames==500&&!getenv("COMBAT_ONLY"))) {
+        Component *inv=_Component.instances[3214];int wanted=game_frames==100?(getenv("EXPAND_TEST")?(getenv("EXPAND_TRIM")?2894:2893):(getenv("COOKING_TEST")?2890:2886)):(getenv("EXPAND_TEST")?(getenv("EXPAND_TRIM")?2897:2896):2889);
+        for(int slot=0;slot<inv->width*inv->height;slot++) if(inv->invSlotObjId[slot]==wanted+1){
+            c->menu_action[0]=38;c->menuParamA[0]=wanted;c->menuParamB[0]=slot;c->menuParamC[0]=3214;useMenuOption(c,0);rs2_log("RESEARCH normal OPHELD2 item=%d slot=%d\n",wanted,slot);break;}
+    }
+    if(!getenv("COMBAT_ONLY") && (game_frames==250 || game_frames==700)){int sx=c->local_player->pathing_entity.pathTileX[0],sz=c->local_player->pathing_entity.pathTileZ[0];bool run=game_frames==700;c->shell->action_key[5]=run?1:0;bool moved=client_try_move(c,sx,sz,sx+3,sz,0,0,0,0,0,0,true);c->shell->action_key[5]=0;rs2_log("RESEARCH normal movement requested run=%d accepted=%d start=%d,%d target=%d,%d\n",run,moved,sx,sz,sx+3,sz);}
+    if(game_frames>=300 && game_frames<380)c->shell->action_key[2]=1;else c->shell->action_key[2]=0;
+    if(game_frames==1000){Component*worn=_Component.instances[1688];if(worn->invSlotObjId[1]>0){c->menu_action[0]=602;c->menuParamA[0]=worn->invSlotObjId[1]-1;c->menuParamB[0]=1;c->menuParamC[0]=1688;useMenuOption(c,0);rs2_log("RESEARCH normal worn-interface unequip requested\n");}}
+    if(getenv("COMBAT_ONLY") && game_frames==600){int best=-1,bestdist=100000,bestop=-1;for(int i=0;i<c->npc_count;i++){int id=c->npc_ids[i];NpcEntity*n=c->npcs[id];if(!n||!n->type||!n->type->name||n->type->vislevel<=0||n->type->vislevel>10||!n->type->op)continue;int op=-1;for(int j=0;j<5;j++)if(n->type->op[j]&&strcmp(n->type->op[j],"Attack")==0)op=j;if(op<0)continue;int dx=n->pathing_entity.pathTileX[0]-c->local_player->pathing_entity.pathTileX[0],dz=n->pathing_entity.pathTileZ[0]-c->local_player->pathing_entity.pathTileZ[0];int distance=dx*dx+dz*dz;if(distance<bestdist){best=id;bestdist=distance;bestop=op;}}if(best>=0){int actions[]={728,542,6,963,245};c->menu_action[0]=actions[bestop];c->menuParamA[0]=best;useMenuOption(c,0);rs2_log("RESEARCH normal NPC Attack name=%s definition=%lld slot=%d distance_sq=%d\n",c->npcs[best]->type->name,(long long)c->npcs[best]->type->index,best,bestdist);}else rs2_log("RESEARCH combat target unavailable\n");}
+    if(getenv("REGRESSION_ONLY")){
+        int component=game_frames==200?RESEARCH_SKILL_ATTACK:game_frames==450?RESEARCH_QUEST_COOK:(game_frames==1150||game_frames==1350)?(getenv("LUMBRIDGE_ONLY")?RESEARCH_LUMBRIDGE:RESEARCH_HOME):-1;
+        if(component>=0){c->menu_action[0]=951;c->menuParamC[0]=component;useMenuOption(c,0);rs2_log("RESEARCH existing IF_BUTTON component=%d frame=%d\n",component,game_frames);}
+        if(game_frames==350||game_frames==600){c->menu_action[0]=947;useMenuOption(c,0);rs2_log("RESEARCH existing close-modal requested\n");}
+        if(game_frames%50==0)rs2_log("RESEARCH viewport_interface=%d chat_interface=%d spot=%d frame=%d\n",c->viewport_interface_id,c->chat_interface_id,c->local_player->pathing_entity.spotanimId,game_frames);
+    }
+    if(getenv("REGRESSION_ONLY") && game_frames>=1300 && game_frames%50==0)rs2_log("RESEARCH latest message=%s\n",c->message_text[0]);
+    if(game_frames%100==0)rs2_log("RESEARCH game frames=%d cape appearance=%d tile=%d,%d sequence=%d player=%s\n",game_frames,c->local_player->appearances[1],c->local_player->pathing_entity.pathTileX[0],c->local_player->pathing_entity.pathTileZ[0],c->local_player->pathing_entity.secondarySeqId,c->local_player->name);
+}
+
+static const char *dp_name[DP_N] = {
+    "setup", "clear", "prescene", "entity", "orbit", "world",
+    "glprep", "glsubmit", "gltail", "post",
+    "chat", "ovclear", "ov2d", "ovhint", "ov3d", "minimap", "coldui", "hud",
+    "holdio",
+    "pixother", "pixcmp", "pixcvt", "pixup", "pixquad",
+    "tail"
+};
+extern void ba_cadence_diagnostic(const char*line);
+static uint64_t dp_frame_us[DP_N];
+static uint64_t dp_us[DP_N], dp_max[DP_N], dp_wall, dp_wall_max, dp_t0, dp_frame_sum, dp_flush_at, dp_prev_log;
+static int64_t dp_gap;
+static unsigned dp_n, dp_overlay, dp_map, dp_uploads, dp_saw_upload;
+static int dp_active, dp_sp, dp_pending, dp_header_done;
+static int dp_saw_overlay, dp_saw_map, dp_pitch, dp_yaw, dp_cam_pitch, dp_cam_yaw, dp_eye_x, dp_eye_z, dp_actors;
+static struct { int bucket; uint64_t at; } dp_stack[8];
+
+static void dp_add(int bucket, uint64_t us) {
+    if (!us || bucket < 0 || bucket >= DP_N) return;
+    dp_us[bucket] += us;dp_frame_us[bucket]+=us;
+    dp_frame_sum += us;
+    if (us > dp_max[bucket]) dp_max[bucket] = us;
+}
+
+void dp_switch(int bucket) {
+    if (!dp_active || bucket < 0 || bucket >= DP_N) return;
+    uint64_t now = ba_timing_now();
+    if (dp_sp > 0) {
+        dp_add(dp_stack[dp_sp - 1].bucket, now - dp_stack[dp_sp - 1].at);
+        dp_stack[dp_sp - 1].bucket = bucket;
+        dp_stack[dp_sp - 1].at = now;
+    } else {
+        dp_stack[0].bucket = bucket;
+        dp_stack[0].at = now;
+        dp_sp = 1;
+    }
+}
+
+void dp_begin(int bucket) {
+    if (!dp_active || dp_sp >= 8 || bucket < 0 || bucket >= DP_N) return;
+    uint64_t now = ba_timing_now();
+    if (dp_sp > 0) dp_add(dp_stack[dp_sp - 1].bucket, now - dp_stack[dp_sp - 1].at);
+    dp_stack[dp_sp].bucket = bucket;
+    dp_stack[dp_sp].at = now;
+    dp_sp++;
+}
+
+void dp_end(void) {
+    if (!dp_active || dp_sp <= 0) return;
+    uint64_t now = ba_timing_now();
+    dp_sp--;
+    dp_add(dp_stack[dp_sp].bucket, now - dp_stack[dp_sp].at);
+    if (dp_sp > 0) dp_stack[dp_sp - 1].at = now;
+}
+
+void dp_mark_overlay(void) { if (dp_active) dp_saw_overlay = 1; }
+void dp_mark_map(void) { if (dp_active) dp_saw_map = 1; }
+void dp_mark_upload(void) { if (dp_active) dp_saw_upload++; }
+
+static void dp_write(uint64_t now) {
+    if (r16_diag_verbose()) {
+        uint64_t io0 = ba_timing_now();
+        FILE *f = fopen("ux0:/data/RS2Vita/draw-phases.txt", "a");
+        if (!f) {
+            r16_io_add(5, ba_timing_now() - io0);
+            return;
+        }
+        if (!dp_header_done) {
+            fputs("exclusive client_draw microseconds. totals/max. gap is wall minus the sum of buckets. nested pixel and gl spans are not also counted in their parents. log is the previous flush and is outside wall.\n", f);
+            dp_header_done = 1;
+        }
+        extern int vita_last_rx, vita_last_ry;
+        fprintf(f, "t=%llu n=%u pitch=%d yaw=%d cam_pitch=%d cam_yaw=%d eye=%d,%d actors=%d stick=%d,%d overlay=%u map=%u uploads=%u wall=%llu/%llu gap=%lld prev_log=%llu",
+            (unsigned long long)now, dp_n, dp_pitch, dp_yaw, dp_cam_pitch, dp_cam_yaw, dp_eye_x, dp_eye_z, dp_actors,
+            vita_last_rx, vita_last_ry,
+            dp_overlay, dp_map, dp_uploads, (unsigned long long)dp_wall, (unsigned long long)dp_wall_max,
+            (long long)dp_gap, (unsigned long long)dp_prev_log);
+        for (int i = 0; i < DP_N; i++) fprintf(f, " %s=%llu/%llu", dp_name[i], (unsigned long long)dp_us[i], (unsigned long long)dp_max[i]);
+        fputc('\n', f);
+        fclose(f);
+        r16_io_add(5, ba_timing_now() - io0);
+    }
+    memset(dp_us, 0, sizeof dp_us);
+    memset(dp_max, 0, sizeof dp_max);
+    dp_n = dp_overlay = dp_map = dp_uploads = 0;
+    dp_wall = dp_wall_max = 0;
+    dp_gap = 0;
+    dp_flush_at = now;
+}
+
+static void dp_frame_begin(void) {
+    if (dp_pending) {
+        uint64_t began = ba_timing_now();
+        dp_write(began);
+        dp_prev_log = ba_timing_now() - began;
+        dp_pending = 0;
+    }
+    r16_dyn_flush();
+    dp_active = 1;
+    dp_sp = 0;
+    dp_frame_sum = 0;memset(dp_frame_us,0,sizeof dp_frame_us);
+    dp_saw_overlay = dp_saw_map = 0;
+    dp_saw_upload = 0;
+    dp_t0 = ba_timing_now();
+    if (!dp_flush_at) dp_flush_at = dp_t0;
+    dp_switch(DP_SETUP);
+}
+
+static void dp_frame_end(Client *c) {
+    uint64_t now = ba_timing_now();
+    while (dp_sp > 0) {
+        dp_sp--;
+        dp_add(dp_stack[dp_sp].bucket, now - dp_stack[dp_sp].at);
+    }
+    uint64_t wall = now - dp_t0;
+    if(wall>50000u&&!r16_diag_verbose()){
+        char line[384];int used=snprintf(line,sizeof line,"# render_hitch %llu wall %llu",(unsigned long long)now,(unsigned long long)wall);
+        for(int i=0;i<DP_N&&used>0&&used<(int)sizeof line-32;i++)if(dp_frame_us[i]>=1000u)used+=snprintf(line+used,sizeof line-used," %s %llu",dp_name[i],(unsigned long long)dp_frame_us[i]);
+        ba_cadence_diagnostic(line);
+    }
+    dp_wall += wall;
+    if (wall > dp_wall_max) dp_wall_max = wall;
+    dp_gap += (int64_t)wall - (int64_t)dp_frame_sum;
+    dp_n++;
+    dp_overlay += (unsigned)dp_saw_overlay;
+    dp_map += (unsigned)dp_saw_map;
+    dp_uploads += dp_saw_upload;
+    dp_pitch = c->orbit_camera_pitch;
+    dp_yaw = c->orbit_camera_yaw & 2047;
+    dp_cam_pitch = c->cameraPitch;
+    dp_cam_yaw = c->cameraYaw & 2047;
+    dp_eye_x = c->cameraX >> 7;
+    dp_eye_z = c->cameraZ >> 7;
+    dp_actors = c->player_count + c->npc_count;
+    dp_frame_sum = 0;
+    dp_active = 0;
+    r13_note_ingame_frame();
+    if (now - dp_flush_at >= 1000000ull) dp_pending = 1;
+}
+
 void client_draw(Client *c) {
+    ve_overlay_held_frame = 0;
+    if(h5_silent())return;
+    if(c->ingame) dp_frame_begin();
+    h5_render_phase(1);
+    if(ba_bench_active&&c->ingame){c->camera_anticheat_offset_x=c->camera_anticheat_offset_z=c->camera_anticheat_angle=0;c->minimap_anticheat_angle=0;c->minimap_zoom=0;}
+
+    ui474_begin(c);
+    migration_research_driver(c);
+    if(c->ingame) dp_switch(DP_CLEAR);
     gl_start_frame();
+    if(c->ingame) dp_switch(DP_SETUP);
 
     if (c->error_started || c->error_loading || c->error_host) {
         client_draw_error(c);
     } else {
         if (c->ingame) {
+            /* Both theme paths consume the logic time accumulated since the last draw. */
+            dp_switch(DP_PRESCENE);
             client_draw_game(c);
+            /* Opt-in screenshots/observations also cover the Classic Brown path. */
+            if (!ve_enabled()) ve_ui_probe(c);
+            c->scene_delta = 0;
         } else {
             client_draw_title_screen(c);
         }
@@ -7813,46 +8910,333 @@ void client_draw(Client *c) {
         c->drag_cycles = 0;
     }
 
-    gl_end_frame();
+    if(c->ingame) dp_switch(DP_TAIL);
+    gl_end_frame();h5_render_phase(0);
+    if(c->ingame) dp_frame_end(c);
+}
+
+static int ve_ui_warm, ve_warm_energy, ve_warm_tab, ve_warm_run, ve_warm_scroll;
+static int ve_map_ready, ve_map_yaw, ve_map_x, ve_map_z;
+static int ve_overlay_ready, ve_overlay_yaw, ve_overlay_pitch, ve_overlay_x, ve_overlay_z;
+static int ve_seen_view = -2, ve_seen_chat = -2, ve_seen_sticky = -2;
+static int ve_seen_modal_x,ve_seen_modal_y;
+static int ve_seen_social, ve_seen_input_open, ve_seen_menu, ve_seen_performance, ve_seen_speech;
+static char ve_seen_modal[MAX_STR];
+static char ve_seen_input[CHATBACK_LENGTH + 1];
+
+#include "r17_menu_overlay.inc"
+
+static int ve_ui_dirty(Client *c) {
+    updateWorldLocationState(c);
+    if (!ve_ui_warm || c->scene_state != 2) return 1;
+    int speech=ve_world_speech_active(c);
+    /* Native speech is transient GPU content, independent of retained UI. */
+    if(!ve_native_markers()&&(speech||speech!=ve_seen_speech))return 1;
+    /* Live modal previews and their hit feedback must not become a held HUD. */
+    if (c->viewport_interface_id >= 0 && !ve_popup_patch_guard) return 1;
+    if (c->redraw_sidebar || c->redraw_chatback || c->redraw_sideicons || c->redraw_privacy_settings) return 1;
+    if ((ve_enabled()&&ve_native_markers()) ? ((c->menu_visible&&!ve_menu_separate(c))||ve_seen_menu_baked) : (c->menu_visible||c->menu_visible!=ve_seen_menu)) return 1;
+    if (_Custom.show_performance != ve_seen_performance) return 1;
+    if (c->chat_interface_id != ve_seen_chat || c->sticky_chat_interface_id != ve_seen_sticky || c->viewport_interface_id != ve_seen_view) return 1;
+    if (ve_script_dirty && !ve_popup_patch_guard) return 1;
+    if (c->show_social_input != ve_seen_social || c->chatback_input_open != ve_seen_input_open) return 1;
+    if (!ve_popup_patch_guard && c->chatback_input_open && strcmp(c->chatback_input, ve_seen_input) != 0) return 1;
+    if (strcmp(c->modal_message, ve_seen_modal) != 0) return 1;
+    if ((c->energy != ve_warm_energy && !(ve_native_markers()&&ui474_energy_patch_ready(c))) || c->selected_tab != ve_warm_tab || c->chat_scroll_offset != ve_warm_scroll || (c->varps && c->varps[173] != ve_warm_run)) return 1;
+    return 0;
+}
+
+/* Routine skill rewards update inventory/stats and chat, not the world or
+ * interface layout. Rasterize the original panels and update only those
+ * texture rectangles; menus, dialogs and layout changes keep the full path. */
+static int ve_patch_skill_panels(Client*c){
+ if(!ve_enabled()||!ui474_enabled()||!ve_native_markers()||!ve_ui_warm||c->scene_state!=2||!c->area_viewport||!c->area_viewport->retained_valid)return 0;
+ int side=c->redraw_sidebar,chat=c->redraw_chatback;
+ if(!side&&!chat)return 0;
+ if(c->viewport_interface_id>=0||c->sidebar_interface_id>=0||c->chat_interface_id>=0||c->sticky_chat_interface_id>=0||c->menu_visible||c->show_social_input||c->chatback_input_open||c->modal_message[0])return 0;
+ const LcRect*sr=&lc_game_geometry(LC_SIDEBAR)->rect,*cr=&lc_game_geometry(LC_CHAT)->rect;
+ const LcRect*rs[]={sr,cr};
+ for(int i=0;i<2;i++){const LcRect*r=rs[i];if(r->x<0||r->y<0||r->w<=0||r->h<=0||r->x+r->w>c->area_viewport->width||r->y+r->h>c->area_viewport->height)return 0;}
+ c->redraw_sidebar=c->redraw_chatback=false;
+ if(ve_ui_dirty(c)){c->redraw_sidebar=side;c->redraw_chatback=chat;return 0;}
+ uint64_t began=ba_timing_now();Pix2D saved=_Pix2D;
+ /* This patch precedes client_draw_scene and its normal GL-to-software
+  * handoff. Icon generation must rasterize into the 32x32 CPU sprite,
+  * never submit its triangles to the world or cache an empty sprite. */
+ bool saved_gl=_Custom.use_opengl11;_Custom.use_opengl11=false;
+ for(int i=0;i<2;i++){
+  if((i==0&&!side)||(i==1&&!chat))continue;const LcRect*r=rs[i];
+  for(int y=r->y;y<r->y+r->h;y++)memset(c->area_viewport->pixels+y*c->area_viewport->width+r->x,0xff,(size_t)r->w*sizeof(int));
+  if(i==0){ui474_draw_sidebar(c);ve_warm_energy=c->energy;}else{client_draw_chatback(c);ve_chat_draw_clean(c);}
+  pixmap_flush_rect(c->area_viewport,r->x,r->y,r->w,r->h);
+ }
+ c->redraw_sidebar=c->redraw_chatback=false;c->area_viewport->dirty=false;_Pix2D=saved;_Custom.use_opengl11=saved_gl;
+ char line[128];snprintf(line,sizeof line,"# panel_patch %llu sidebar %d chat %d us %llu",(unsigned long long)ba_timing_now(),side,chat,(unsigned long long)(ba_timing_now()-began));ba_cadence_diagnostic(line);
+ return 1;
+}
+
+#include "../r19_popup_state.inc"
+static uint64_t popup_chat_us,popup_compose_us,popup_clear_us,popup_flush_us,popup_state_us;
+
+/* Stable popup layouts update their own original pixel rectangles. Input
+ * and animation still run normally; exact pixel comparison suppresses only
+ * unchanged uploads. Opening/closing/layout changes use the full UI path. */
+static int ve_patch_popup_regions(Client*c,int paint){
+ if(!ve_enabled()||!ve_native_markers()||!ui474_enabled()||!ve_ui_warm||c->scene_state!=2||
+    !c->area_viewport||!c->area_viewport->retained_valid||ve_complex_overlay(c))return 0;
+ int view=c->viewport_interface_id;
+ if(view<0&&c->chat_interface_id<0&&c->sticky_chat_interface_id<0&&!c->chatback_input_open)return 0;
+ if(view>=0&&(client_modal_offset(c,view,1)!=ve_seen_modal_x||client_modal_y(c,view,1)!=ve_seen_modal_y))return 0;
+ if(view!=ve_seen_view||c->chat_interface_id!=ve_seen_chat||c->sticky_chat_interface_id!=ve_seen_sticky)return 0;
+ if(c->obj_drag_area||c->show_social_input||c->modal_message[0])return 0;
+ int side=c->redraw_sidebar,chat=c->redraw_chatback;
+ c->redraw_sidebar=c->redraw_chatback=false;ve_popup_patch_guard=1;
+ int other=ve_ui_dirty(c);ve_popup_patch_guard=0;
+ c->redraw_sidebar=side;c->redraw_chatback=chat;if(other)return 0;
+ const LcRect*sr=&lc_game_geometry(LC_SIDEBAR)->rect,*cr=&lc_game_geometry(LC_CHAT)->rect;
+ LcRect modal={0};Component*root=NULL;
+ if(view>=0){
+  if(view>=_Component.count||!(root=_Component.instances[view]))return 0;
+  modal=(LcRect){224+client_modal_offset(c,view,1),client_modal_y(c,view,1),root->width,root->height};
+ }
+ int drawchat=chat||c->chat_interface_id>=0||c->sticky_chat_interface_id>=0||c->chatback_input_open;
+ const LcRect*rs[]={&modal,sr,cr};int active[]={view>=0,side,drawchat};
+ /* Recompose overlapping retained panels, then paint the popup on top of
+  * the minimized chat's transparent background. */
+ if(view>=0)for(int i=1;i<3;i++){const LcRect*r=rs[i];
+  if(modal.x<r->x+r->w&&modal.x+modal.w>r->x&&modal.y<r->y+r->h&&modal.y+modal.h>r->y)active[i]=1;
+ }
+ const LcRect*map=&lc_game_geometry(LC_MINIMAP)->rect;
+ int map_overlap=view>=0&&modal.x<map->x+map->w&&modal.x+modal.w>map->x&&modal.y<map->y+map->h&&modal.y+modal.h>map->y;
+ for(int i=0;i<3;i++)if(active[i]){const LcRect*r=rs[i];
+  if(r->x<0||r->y<0||r->w<=0||r->h<=0||r->w>c->area_viewport->width-r->x||r->h>c->area_viewport->height-r->y)return 0;
+ }
+ if(!paint)return 1;
+ uint64_t state_at=ba_timing_now();int snapshot_ok=popup_state_build(c);popup_state_us+=ba_timing_now()-state_at;
+ int same=snapshot_ok&&popup_state_valid&&popup_before_n==popup_now_n&&!memcmp(popup_before,popup_now,popup_now_n);
+ if(same&&!side&&!chat&&!ve_script_dirty){popup_reuses++;return 1;}
+ popup_rasters++;popup_reason=side|(chat<<1)|(ve_script_dirty<<2)|((!snapshot_ok)<<3)|((!same)<<4);
+ popup_diff_component=popup_diff_relative=-1;
+ if(snapshot_ok&&popup_state_valid&&!same){size_t diff=0,n=popup_now_n<popup_before_n?popup_now_n:popup_before_n;
+  while(diff<n&&popup_now[diff]==popup_before[diff])diff++;
+  for(int i=0;i<popup_trace_n;i++)if(popup_trace_start[i]<=diff){popup_diff_component=popup_trace_id[i];popup_diff_relative=(int)(diff-popup_trace_start[i]);}
+ }
+ Pix2D saved=_Pix2D;bool saved_gl=_Custom.use_opengl11;int*saved_lines=_Pix3D.line_offset;
+ _Custom.use_opengl11=false;pixmap_bind(c->area_viewport);_Pix3D.line_offset=c->area_viewport_offsets;
+ for(int pass=0;pass<3;pass++){int i=2-pass;if(active[i]){const LcRect*r=rs[i];
+  uint64_t at=ba_timing_now();
+  for(int y=r->y;y<r->y+r->h;y++)memset(c->area_viewport->pixels+y*c->area_viewport->width+r->x,0xff,(size_t)r->w*sizeof(int));
+  popup_clear_us+=ba_timing_now()-at;at=ba_timing_now();
+  if(i==0)client_draw_interface(c,root,r->x,r->y,0);
+  else if(i==1)ui474_draw_sidebar(c);
+  else{client_draw_chatback(c);popup_chat_us+=ba_timing_now()-at;at=ba_timing_now();ve_chat_draw_clean(c);}
+  popup_compose_us+=ba_timing_now()-at;
+ }}
+ if(map_overlap){ve_map_gl_hole_reset();ve_map_gl_prepare_cold(c);}
+ uint64_t flush_at=ba_timing_now();for(int i=0;i<3;i++)if(active[i]){const LcRect*r=rs[i];pixmap_flush_changed_rect(c->area_viewport,r->x,r->y,r->w,r->h);}popup_flush_us+=ba_timing_now()-flush_at;
+ c->area_viewport->dirty=false;_Pix2D=saved;_Pix3D.line_offset=saved_lines;_Custom.use_opengl11=saved_gl;
+ c->redraw_sidebar=c->redraw_chatback=false;ve_script_dirty=0;
+ state_at=ba_timing_now();popup_state_valid=popup_state_build(c);popup_state_us+=ba_timing_now()-state_at;if(popup_state_valid){memcpy(popup_before,popup_now,popup_now_n);popup_before_n=popup_now_n;}
+ ve_warm_energy=c->energy;ve_warm_tab=c->selected_tab;ve_warm_scroll=c->chat_scroll_offset;ve_warm_run=c->varps?c->varps[173]:0;
+ memcpy(ve_seen_input,c->chatback_input,CHATBACK_LENGTH+1);ve_seen_input[CHATBACK_LENGTH]=0;
+ return 1;
+}
+
+static void ve_ui_commit(Client *c) {
+    popup_state_valid=0;
+    ve_ui_warm = c->scene_state == 2;
+    ve_warm_energy = c->energy;
+    ve_warm_tab = c->selected_tab;
+    ve_warm_scroll = c->chat_scroll_offset;
+    ve_warm_run = c->varps ? c->varps[173] : 0;
+    ve_seen_view = c->viewport_interface_id;
+    ve_seen_modal_x=client_modal_offset(c,ve_seen_view,1);ve_seen_modal_y=client_modal_y(c,ve_seen_view,1);
+    ve_seen_chat = c->chat_interface_id;
+    ve_seen_sticky = c->sticky_chat_interface_id;
+    ve_seen_speech=ve_world_speech_active(c);
+    ve_seen_menu = c->menu_visible;
+    ve_seen_menu_baked = c->menu_visible&&!ve_menu_separate(c);
+    ve_seen_performance = _Custom.show_performance;
+    ve_seen_social = c->show_social_input;
+    ve_seen_input_open = c->chatback_input_open;
+    memcpy(ve_seen_modal, c->modal_message, MAX_STR);
+    ve_seen_modal[MAX_STR - 1] = 0;
+    memcpy(ve_seen_input, c->chatback_input, CHATBACK_LENGTH + 1);
+    ve_seen_input[CHATBACK_LENGTH] = 0;
+    ve_script_dirty = 0;
+    c->redraw_sidebar = c->redraw_chatback = c->redraw_sideicons = c->redraw_privacy_settings = false;
+    ve_map_ready = 0;
+    ve_overlay_ready = 0;
 }
 
 void client_draw_game(Client *c) {
+#ifdef GL11
+    extern int recovery_water_reference;
+    extern int recovery_reference_yaw;
+    extern int recovery_reference_pitch;
+    extern int r10_camera_replay(Client*);
+    int r10_replay=!h8_is_running()&&r10_camera_replay(c);
+    if(recovery_water_reference>=0&&!h8_is_running()&&!r10_replay){
+        // Reference captures only. No player, NPC, quest or server timing changes.
+        c->orbit_camera_yaw=recovery_reference_yaw;c->orbit_camera_pitch=recovery_reference_pitch;
+        c->camera_anticheat_offset_x=c->camera_anticheat_offset_z=c->camera_anticheat_angle=0;
+        c->minimap_anticheat_angle=c->minimap_zoom=0;
+    }
+#endif
+    ui474_begin(c);
+    ve_prepare(c);
+    // Both themes consume the same elapsed logic steps exactly once per draw.
+    // Enhanced returns below, so animation advancement must precede that branch.
+    if (c->sidebar_interface_id != -1 &&
+        client_update_interface_animation(c, c->sidebar_interface_id, c->scene_delta)) {
+        c->redraw_sidebar = true;
+    }
+    if (c->chat_interface_id != -1 &&
+        client_update_interface_animation(c, c->chat_interface_id, c->scene_delta)) {
+        c->redraw_chatback = true;
+    }
+    ve_anim_advanced = 0;
+    ve_input_advanced = 0;
+    if (c->viewport_interface_id != -1) {
+        ve_anim_advanced = 1;
+        client_update_interface_animation(c, c->viewport_interface_id, c->scene_delta);
+    }
+    if(ve_enabled()){
+      uint64_t begin=rs2_now();
+      ve_menu_prepare(c);
+      ve_patch_skill_panels(c);
+      ve_popup_frame=ve_patch_popup_regions(c,0);
+      int ve_hold=c->scene_state==2 && !ve_ui_dirty(c);
+      if(h5_mode()=='U'||h5_mode()=='M'){pixmap_bind(c->area_viewport);pix2d_clear();_Custom.use_opengl11=false;ve_hold=0;}
+      else if(c->scene_state==2)client_draw_scene(c);else pixmap_draw(c->area_viewport,0,0);
+      uint64_t world_done=rs2_now();
+      if(!ve_hold||ve_popup_frame){
+        if(ve_patch_popup_regions(c,1))ve_hold=1;
+        else if(ve_popup_frame){pixmap_bind(c->area_viewport);pix2d_clear();drawTileHint(c);draw3DEntityElements(c);}
+      }
+      dp_switch(DP_CHAT);
+      if(c->chat_interface_id<0&&!ve_chat_hidden(c)){c->chat_interface->scrollPosition=c->chat_scroll_height-c->chat_scroll_offset-77;
+       if(c->shell->mouse_x>=ve_chat_text_x()+lc_chat_text_right(CHAT_TEXT_RIGHT)&&c->shell->mouse_x<ve_chat_text_x()+650&&c->shell->mouse_y>=ve_chat_text_y()&&c->shell->mouse_y<ve_chat_text_y()+77)client_handle_scroll_input(c,c->shell->mouse_x-ve_chat_text_x(),c->shell->mouse_y-ve_chat_text_y(),c->chat_scroll_height,77,false,lc_chat_text_right(CHAT_TEXT_RIGHT),0,c->chat_interface);
+       int offset=c->chat_scroll_height-c->chat_interface->scrollPosition-77;if(offset<0)offset=0;if(offset>c->chat_scroll_height-77)offset=c->chat_scroll_height-77;c->chat_scroll_offset=offset;}
+      int h3_full=(h3_mode()=='G'||h3_mode()=='H'||h3_mode()=='A')&&h5_mode()!='M';
+      int pixels_changed=!ve_hold;
+      if(ve_hold&&c->energy!=ve_warm_energy&&ui474_energy_patch(c))ve_warm_energy=c->energy;
+      if(!ve_hold&&!r16_diag_verbose()){
+        char line[224];snprintf(line,sizeof line,"# cold_ui %llu energy %d/%d run %d/%d sidebar %d chat %d icons %d privacy %d script %d menu %d/%d view %d",(unsigned long long)ba_timing_now(),c->energy,ve_warm_energy,c->varps?c->varps[173]:0,ve_warm_run,c->redraw_sidebar,c->redraw_chatback,c->redraw_sideicons,c->redraw_privacy_settings,ve_script_dirty,c->menu_visible,ve_seen_menu,c->viewport_interface_id);ba_cadence_diagnostic(line);
+      }
+      if(ve_hold){
+        int ax=c->local_player?c->local_player->pathing_entity.x/32:0;
+        int az=c->local_player?c->local_player->pathing_entity.z/32:0;
+        int iface=c->viewport_interface_id>=0||c->chat_interface_id>=0||c->sticky_chat_interface_id>=0;
+        int look=!ve_overlay_ready||ve_overlay_yaw!=c->orbit_camera_yaw||ve_overlay_pitch!=c->orbit_camera_pitch||ve_overlay_x!=ax||ve_overlay_z!=az;
+        int overlay_drew=0;
+        if(look&&!iface&&(!ve_native_markers()||ve_complex_overlay(c))){
+          dp_switch(DP_OVCLEAR);
+          ve_clear_world(c);
+          dp_switch(DP_OV2D);
+          if(!ve_native_markers())draw2DEntityElements(c);
+          dp_switch(DP_OVHINT);
+          drawTileHint(c);
+          dp_switch(DP_OV3D);
+          draw3DEntityElements(c);
+          ve_overlay_yaw=c->orbit_camera_yaw;ve_overlay_pitch=c->orbit_camera_pitch;ve_overlay_x=ax;ve_overlay_z=az;ve_overlay_ready=1;
+          pixels_changed=1;
+          overlay_drew=1;
+          dp_mark_overlay();
+        }
+        /* The rotating map is drawn in GL after the viewport quad. Punch a
+         * transparent hole once so the world shows around the fan. */
+        if((h3_full||h3_mode()=='F'||h5_mode()=='M')&&h5_mode()!='U'){
+          dp_switch(DP_MINIMAP);
+          ve_map_gl_prepare(c);
+        }
+        ve_map_yaw=c->orbit_camera_yaw;ve_map_x=ax;ve_map_z=az;ve_map_ready=1;
+      }else{
+      ve_map_gl_hole_reset();
+      ve_hud_gl_reset();
+      dp_switch(DP_COLDUI);
+      if(h3_full){H3_SCOPE(H3_CHAT);client_draw_chatback(c);}
+      if(!ve_native_markers()&&(h3_full||h3_mode()=='F'||h5_mode()=='M')&&h5_mode()!='U'&&c->scene_state==2){H3_SCOPE(H3_MINIMAP);client_draw_minimap(c);}
+      if(h3_full){H3_SCOPE(H3_UI);
+        const LcRect*r=&lc_game_geometry(LC_CHAT)->rect;
+        if(ve_native_markers()&&c->viewport_interface_id<0&&!ve_complex_overlay(c)&&r->x>=0&&r->y>=0&&r->w>0&&r->h>0&&r->w<=c->area_viewport->width-r->x&&r->h<=c->area_viewport->height-r->y){
+          ui474_draw_sidebar(c);
+          for(int y=r->y;y<r->y+r->h;y++)memset(c->area_viewport->pixels+(size_t)y*c->area_viewport->width+r->x,0xff,(size_t)r->w*sizeof(int));
+          ve_chat_draw_clean(c);
+        }else{
+          ui474_draw(c);
+          /* With chat minimized the popup can occupy its old rectangle.
+           * Compose it after the hidden-chat background, just as the
+           * retained-region path does, so no transparent cutout remains. */
+          if(ve_chat_hidden(c)&&c->viewport_interface_id>=0&&c->viewport_interface_id<_Component.count){
+            Component*root=_Component.instances[c->viewport_interface_id];
+            if(root){pixmap_bind(c->area_viewport);_Pix3D.line_offset=c->area_viewport_offsets;
+              client_draw_interface(c,root,224+client_modal_offset(c,root->id,1),client_modal_y(c,root->id,1),0);}
+          }
+        }
+      }
+      if((h3_full||h3_mode()=='F'||h5_mode()=='M')&&h5_mode()!='U'){H3_SCOPE(H3_MINIMAP);if(ve_native_markers())ve_map_gl_prepare_cold(c);else ve_map_draw(c);}
+      ve_ui_commit(c);
+      }
+      dp_switch(DP_HUD);
+      ve_draw_location_status(c);
+      ve_draw_barrows_progress(c);
+      {char h4_lines[3][128];h4_hud_lines(h4_lines);
+       /* Compose the diagnostic text under interface panels. No destructive
+        * transparent rectangle is needed in the retained UI texture. */
+       if (_Custom.show_performance) {
+           ve_hud_gl_update(c,h4_lines);ve_hud_gl_draw();
+           Pix2D saved=_Pix2D;PixMap*p=ve_effect_surface(MAX_CHATS+9,256,96);
+           if(p){draw_info_overlay_local(c,252,-21);ve_effect_finish(p,saved,PERF_RIGHT(507)-252,PERF_BASELINE(52)-18);}
+           else _Pix2D=saved;
+       }
+       if(h8_is_armed()&&!h8_is_running()){pixmap_bind(c->area_viewport);drawString(c->font_plain11,12,100,"Remote armed - SELECT stops",YELLOW);pixels_changed=1;}}
+      if(!pixels_changed&&c->area_viewport)c->area_viewport->dirty=false;
+      {H3_SCOPE(H3_OVERLAY);pixmap_draw(c->area_viewport,0,0);pixmap_bind(c->area_viewport);_Pix3D.line_offset=c->area_viewport_offsets;}
+      if((ve_hold||ve_native_markers())&&(h3_full||h3_mode()=='F'||h5_mode()=='M')&&h5_mode()!='U'){dp_switch(DP_MINIMAP);ve_map_gl_draw(c);}
+      ve_menu_draw(c);
+      dp_switch(DP_HOLDIO);
+      {static unsigned hold_n,cold_n;static uint64_t logged;if(ve_hold)hold_n++;else cold_n++;if(r16_diag_verbose()){uint64_t stamp=rs2_now();if(stamp-logged>=2000ull){logged=stamp;uint64_t io0=ba_timing_now();FILE*f=fopen("ux0:/data/RS2Vita/ui-hold.txt","w");if(f){fprintf(f,"hold=%u cold=%u view=%d chat=%d sticky=%d\n",hold_n,cold_n,c->viewport_interface_id,c->chat_interface_id,c->sticky_chat_interface_id);fclose(f);}r16_io_add(0,ba_timing_now()-io0);}}}
+      static unsigned frames=0;static unsigned long long world_ms=0,ui_ms=0;world_ms+=world_done-begin;ui_ms+=rs2_now()-world_done;if(++frames%100==0&&getenv("CLASSIC_MIGRATION_TEST"))rs2_log("VITA_ENHANCED_TIMING frames=%u world_ms=%llu ui_ms=%llu viewport=960x544\n",frames,world_ms,ui_ms);
+      return;
+    }
+
     if (c->redraw_background) {
         c->redraw_background = false;
         pixmap_draw(c->area_backleft1, 0, 11);
-        pixmap_draw(c->area_backleft2, 0, 375);
-        pixmap_draw(c->area_backright1, 729, 5);
-        pixmap_draw(c->area_backright2, 752, 231);
+        lc_draw(c->area_backleft2,LC_CHAT, lc_x(LC_CHAT,0), (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
+        lc_draw(c->area_backright1,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(729)), lc_y(LC_MINIMAP,5));
+        lc_draw(c->area_backright2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(752)), lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
         pixmap_draw(c->area_backtop1, 0, 0);
-        pixmap_draw(c->area_backtop2, 561, 0);
-        pixmap_draw(c->area_backvmid1, 520, 11);
-        pixmap_draw(c->area_backvmid2, 520, 231);
-        pixmap_draw(c->area_backvmid3, 501, 375);
-        pixmap_draw(c->area_backhmid2, 0, 345);
+        lc_draw(c->area_backtop2,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(561)), lc_y(LC_MINIMAP,0));
+        pixmap_draw(c->area_backvmid1, UI_RIGHT(520), 11);
+        lc_draw(c->area_backvmid2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(520)), lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
+        lc_draw(c->area_backvmid3,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(501)), lc_y(LC_SIDEBAR,UI_BOTTOM(375)));
+        lc_draw(c->area_backhmid2,LC_CHAT, lc_x(LC_CHAT,0), lc_y(LC_CHAT,UI_BOTTOM(345)));
         c->redraw_sidebar = true;
         c->redraw_chatback = true;
         c->redraw_sideicons = true;
         c->redraw_privacy_settings = true;
         if (c->scene_state != 2) {
-            pixmap_draw(c->area_viewport, 8, 11);
-            pixmap_draw(c->area_mapback, 561, 5);
+            if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
+            lc_draw(c->area_mapback,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(561)), lc_y(LC_MINIMAP,5));
         }
     }
 #ifdef GL11
     else {
         pixmap_draw(c->area_backleft1, 0, 11);
-        pixmap_draw(c->area_backleft2, 0, 375);
-        pixmap_draw(c->area_backright1, 729, 5);
-        pixmap_draw(c->area_backright2, 752, 231);
+        lc_draw(c->area_backleft2,LC_CHAT, lc_x(LC_CHAT,0), (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
+        lc_draw(c->area_backright1,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(729)), lc_y(LC_MINIMAP,5));
+        lc_draw(c->area_backright2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(752)), lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
         pixmap_draw(c->area_backtop1, 0, 0);
-        pixmap_draw(c->area_backtop2, 561, 0);
-        pixmap_draw(c->area_backvmid1, 520, 11);
-        pixmap_draw(c->area_backvmid2, 520, 231);
-        pixmap_draw(c->area_backvmid3, 501, 375);
-        pixmap_draw(c->area_backhmid2, 0, 345);
+        lc_draw(c->area_backtop2,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(561)), lc_y(LC_MINIMAP,0));
+        pixmap_draw(c->area_backvmid1, UI_RIGHT(520), 11);
+        lc_draw(c->area_backvmid2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(520)), lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
+        lc_draw(c->area_backvmid3,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(501)), lc_y(LC_SIDEBAR,UI_BOTTOM(375)));
+        lc_draw(c->area_backhmid2,LC_CHAT, lc_x(LC_CHAT,0), lc_y(LC_CHAT,UI_BOTTOM(345)));
         if (c->scene_state != 2) {
-            pixmap_draw(c->area_viewport, 8, 11);
-            pixmap_draw(c->area_mapback, 561, 5);
+            if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
+            lc_draw(c->area_mapback,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(561)), lc_y(LC_MINIMAP,5));
         }
     }
 #endif
@@ -7860,16 +9244,22 @@ void client_draw_game(Client *c) {
     if (c->scene_state == 2) {
         client_draw_scene(c);
     }
+    if(lc_dx(LC_SIDEBAR)||lc_dy(LC_SIDEBAR)){
+      c->redraw_sidebar=c->redraw_sideicons=c->redraw_chatback=c->redraw_privacy_settings=true;
+      lc_draw(c->area_backvmid2,LC_SIDEBAR,lc_x(LC_SIDEBAR,UI_RIGHT(520)),lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
+      lc_draw(c->area_backvmid3,LC_SIDEBAR,lc_x(LC_SIDEBAR,UI_RIGHT(501)),lc_y(LC_SIDEBAR,UI_BOTTOM(375)));
+      lc_draw(c->area_backright2,LC_SIDEBAR,lc_x(LC_SIDEBAR,UI_RIGHT(752)),lc_y(LC_SIDEBAR,UI_BOTTOM(231)));
+      lc_draw(c->area_backright1,LC_MINIMAP,lc_x(LC_MINIMAP,UI_RIGHT(729)),lc_y(LC_MINIMAP,5));
+      lc_draw(c->area_backtop2,LC_MINIMAP,lc_x(LC_MINIMAP,UI_RIGHT(561)),lc_y(LC_MINIMAP,0));
+      lc_draw(c->area_backleft2,LC_CHAT,lc_x(LC_CHAT,0),(ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
+      lc_draw(c->area_backhmid2,LC_CHAT,lc_x(LC_CHAT,0),lc_y(LC_CHAT,UI_BOTTOM(345)));
+    }
+
+
+
 
     if (c->menu_visible && c->menu_area == 1) {
         c->redraw_sidebar = true;
-    }
-
-    if (c->sidebar_interface_id != -1) {
-        bool redraw = client_update_interface_animation(c, c->sidebar_interface_id, c->scene_delta);
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
     }
 
     if (c->selected_area == 2) {
@@ -7886,14 +9276,14 @@ void client_draw_game(Client *c) {
     }
 #ifdef GL11
     else {
-        pixmap_draw(c->area_sidebar, 562, 231);
+        lc_draw(c->area_sidebar,LC_SIDEBAR, ui474_side_x(), ui474_side_y());
     }
 #endif
 
     if (c->chat_interface_id == -1) {
         c->chat_interface->scrollPosition = c->chat_scroll_height - c->chat_scroll_offset - 77;
-        if (c->shell->mouse_x > 453 && c->shell->mouse_x < 565 && c->shell->mouse_y > 350) {
-            client_handle_scroll_input(c, c->shell->mouse_x - 22, c->shell->mouse_y - 375, c->chat_scroll_height, 77, false, 463, 0, c->chat_interface);
+        if (c->shell->mouse_x >= 22 + lc_chat_text_right(CHAT_TEXT_RIGHT) && c->shell->mouse_x < 22 + lc_chat_text_right(CHAT_TEXT_RIGHT) + 16 && c->shell->mouse_y >= (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))) && c->shell->mouse_y < lc_y(LC_CHAT,UI_BOTTOM(471))) {
+            client_handle_scroll_input(c, c->shell->mouse_x - (ve_enabled()?ve_chat_text_x():22), c->shell->mouse_y - (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))), c->chat_scroll_height, 77, false, lc_chat_text_right(CHAT_TEXT_RIGHT), 0, c->chat_interface);
         }
 
         int offset = c->chat_scroll_height - c->chat_interface->scrollPosition - 77;
@@ -7907,13 +9297,6 @@ void client_draw_game(Client *c) {
 
         if (c->chat_scroll_offset != offset) {
             c->chat_scroll_offset = offset;
-            c->redraw_chatback = true;
-        }
-    }
-
-    if (c->chat_interface_id != -1) {
-        bool redraw = client_update_interface_animation(c, c->chat_interface_id, c->scene_delta);
-        if (redraw) {
             c->redraw_chatback = true;
         }
     }
@@ -7940,13 +9323,13 @@ void client_draw_game(Client *c) {
     }
 #ifdef GL11
     else {
-        pixmap_draw(c->area_chatback, 22, 375);
+        if(!ve_enabled())lc_draw(c->area_chatback,LC_CHAT, (ve_enabled()?ve_chat_text_x():lc_x(LC_CHAT,22)), (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
     }
 #endif
 
     if (c->scene_state == 2) {
         client_draw_minimap(c);
-        pixmap_draw(c->area_mapback, 561, 5);
+        lc_draw(c->area_mapback,LC_MINIMAP, lc_x(LC_MINIMAP,UI_RIGHT(561)), lc_y(LC_MINIMAP,5));
     }
 
     if (c->flashing_tab != -1) {
@@ -7954,12 +9337,6 @@ void client_draw_game(Client *c) {
     }
 
     if (c->redraw_sideicons) {
-        if (c->flashing_tab != -1 && c->flashing_tab == c->selected_tab) {
-            c->flashing_tab = -1;
-            // TUTORIAL_CLICKSIDE
-            p1isaac(c->out, 175);
-            p1(c->out, c->selected_tab);
-        }
 
         c->redraw_sideicons = false;
         pixmap_bind(c->area_backhmid1);
@@ -7968,52 +9345,52 @@ void client_draw_game(Client *c) {
         if (c->sidebar_interface_id == -1) {
             if (c->tab_interface_id[c->selected_tab] != -1) {
                 if (c->selected_tab == 0) {
-                    pix8_draw(c->image_redstone1, 29, 30);
+                    pix8_draw(c->image_redstone1, 29, UI_BOTTOM(30));
                 } else if (c->selected_tab == 1) {
-                    pix8_draw(c->image_redstone2, 59, 29);
+                    pix8_draw(c->image_redstone2, 59, UI_BOTTOM(29));
                 } else if (c->selected_tab == 2) {
-                    pix8_draw(c->image_redstone2, 87, 29);
+                    pix8_draw(c->image_redstone2, 87, UI_BOTTOM(29));
                 } else if (c->selected_tab == 3) {
-                    pix8_draw(c->image_redstone3, 115, 29);
+                    pix8_draw(c->image_redstone3, 115, UI_BOTTOM(29));
                 } else if (c->selected_tab == 4) {
-                    pix8_draw(c->image_redstone2h, 156, 29);
+                    pix8_draw(c->image_redstone2h, 156, UI_BOTTOM(29));
                 } else if (c->selected_tab == 5) {
-                    pix8_draw(c->image_redstone2h, 184, 29);
+                    pix8_draw(c->image_redstone2h, 184, UI_BOTTOM(29));
                 } else if (c->selected_tab == 6) {
-                    pix8_draw(c->image_redstone1h, 212, 30);
+                    pix8_draw(c->image_redstone1h, 212, UI_BOTTOM(30));
                 }
             }
 
             if (c->tab_interface_id[0] != -1 && (c->flashing_tab != 0 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[0], 35, 34);
+                pix8_draw(c->image_sideicons[0], 35, UI_BOTTOM(34));
             }
 
             if (c->tab_interface_id[1] != -1 && (c->flashing_tab != 1 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[1], 59, 32);
+                pix8_draw(c->image_sideicons[1], 59, UI_BOTTOM(32));
             }
 
             if (c->tab_interface_id[2] != -1 && (c->flashing_tab != 2 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[2], 86, 32);
+                pix8_draw(c->image_sideicons[2], 86, UI_BOTTOM(32));
             }
 
             if (c->tab_interface_id[3] != -1 && (c->flashing_tab != 3 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[3], 121, 33);
+                pix8_draw(c->image_sideicons[3], 121, UI_BOTTOM(33));
             }
 
             if (c->tab_interface_id[4] != -1 && (c->flashing_tab != 4 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[4], 157, 34);
+                pix8_draw(c->image_sideicons[4], 157, UI_BOTTOM(34));
             }
 
             if (c->tab_interface_id[5] != -1 && (c->flashing_tab != 5 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[5], 185, 32);
+                pix8_draw(c->image_sideicons[5], 185, UI_BOTTOM(32));
             }
 
             if (c->tab_interface_id[6] != -1 && (c->flashing_tab != 6 || _Client.loop_cycle % 20 < 10)) {
-                pix8_draw(c->image_sideicons[6], 212, 34);
+                pix8_draw(c->image_sideicons[6], 212, UI_BOTTOM(34));
             }
         }
 
-        pixmap_draw(c->area_backhmid1, 520, 165);
+        lc_draw(c->area_backhmid1,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(520)), lc_y(LC_SIDEBAR,165));
         pixmap_bind(c->area_backbase2);
         pix8_draw(c->image_backbase2, 0, 0);
 
@@ -8060,13 +9437,13 @@ void client_draw_game(Client *c) {
                 pix8_draw(c->image_sideicons[12], 230, 2);
             }
         }
-        pixmap_draw(c->area_backbase2, 501, 492);
+        lc_draw(c->area_backbase2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(501)), lc_y(LC_SIDEBAR,UI_BOTTOM(492)));
         pixmap_bind(c->area_viewport);
     }
 #ifdef GL11
     else {
-        pixmap_draw(c->area_backhmid1, 520, 165);
-        pixmap_draw(c->area_backbase2, 501, 492);
+        lc_draw(c->area_backhmid1,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(520)), lc_y(LC_SIDEBAR,165));
+        lc_draw(c->area_backbase2,LC_SIDEBAR, lc_x(LC_SIDEBAR,UI_RIGHT(501)), lc_y(LC_SIDEBAR,UI_BOTTOM(492)));
     }
 #endif
 
@@ -8076,56 +9453,57 @@ void client_draw_game(Client *c) {
         pixmap_bind(c->area_backbase1);
         pix8_draw(c->image_backbase1, 0, 0);
 
-        drawStringTaggableCenter(c->font_plain12, "Public chat", 57, 33, WHITE, true);
+        drawStringTaggableCenter(c->font_plain12, "Public chat", CHAT_BUTTON_X(57, 0), 33, WHITE, true);
         if (c->public_chat_setting == 0) {
-            drawStringTaggableCenter(c->font_plain12, "On", 57, 46, GREEN, true);
+            drawStringTaggableCenter(c->font_plain12, "On", CHAT_BUTTON_X(57, 0), 46, GREEN, true);
         }
         if (c->public_chat_setting == 1) {
-            drawStringTaggableCenter(c->font_plain12, "Friends", 57, 46, YELLOW, true);
+            drawStringTaggableCenter(c->font_plain12, "Friends", CHAT_BUTTON_X(57, 0), 46, YELLOW, true);
         }
         if (c->public_chat_setting == 2) {
-            drawStringTaggableCenter(c->font_plain12, "Off", 57, 46, RED, true);
+            drawStringTaggableCenter(c->font_plain12, "Off", CHAT_BUTTON_X(57, 0), 46, RED, true);
         }
         if (c->public_chat_setting == 3) {
-            drawStringTaggableCenter(c->font_plain12, "Hide", 57, 46, CYAN, true);
+            drawStringTaggableCenter(c->font_plain12, "Hide", CHAT_BUTTON_X(57, 0), 46, CYAN, true);
         }
 
-        drawStringTaggableCenter(c->font_plain12, "Private chat", 186, 33, WHITE, true);
+        drawStringTaggableCenter(c->font_plain12, "Private chat", CHAT_BUTTON_X(186, 1), 33, WHITE, true);
         if (c->private_chat_setting == 0) {
-            drawStringTaggableCenter(c->font_plain12, "On", 186, 46, GREEN, true);
+            drawStringTaggableCenter(c->font_plain12, "On", CHAT_BUTTON_X(186, 1), 46, GREEN, true);
         }
         if (c->private_chat_setting == 1) {
-            drawStringTaggableCenter(c->font_plain12, "Friends", 186, 46, YELLOW, true);
+            drawStringTaggableCenter(c->font_plain12, "Friends", CHAT_BUTTON_X(186, 1), 46, YELLOW, true);
         }
         if (c->private_chat_setting == 2) {
-            drawStringTaggableCenter(c->font_plain12, "Off", 186, 46, RED, true);
+            drawStringTaggableCenter(c->font_plain12, "Off", CHAT_BUTTON_X(186, 1), 46, RED, true);
         }
 
-        drawStringTaggableCenter(c->font_plain12, "Trade/duel", 326, 33, WHITE, true);
+        drawStringTaggableCenter(c->font_plain12, "Trade/duel", CHAT_BUTTON_X(326, 2), 33, WHITE, true);
         if (c->trade_chat_setting == 0) {
-            drawStringTaggableCenter(c->font_plain12, "On", 326, 46, GREEN, true);
+            drawStringTaggableCenter(c->font_plain12, "On", CHAT_BUTTON_X(326, 2), 46, GREEN, true);
         }
         if (c->trade_chat_setting == 1) {
-            drawStringTaggableCenter(c->font_plain12, "Friends", 326, 46, YELLOW, true);
+            drawStringTaggableCenter(c->font_plain12, "Friends", CHAT_BUTTON_X(326, 2), 46, YELLOW, true);
         }
         if (c->trade_chat_setting == 2) {
-            drawStringTaggableCenter(c->font_plain12, "Off", 326, 46, RED, true);
+            drawStringTaggableCenter(c->font_plain12, "Off", CHAT_BUTTON_X(326, 2), 46, RED, true);
         }
 
-        drawStringTaggableCenter(c->font_plain12, "Report abuse", 462, 38, WHITE, true);
-        pixmap_draw(c->area_backbase1, 0, 471);
+        drawStringTaggableCenter(c->font_plain12, "Report abuse", CHAT_BUTTON_X(462, 3), 38, WHITE, true);
+        lc_draw(c->area_backbase1,LC_CHAT, lc_x(LC_CHAT,0), lc_y(LC_CHAT,UI_BOTTOM(471)));
         pixmap_bind(c->area_viewport);
     }
 #ifdef GL11
     else {
-        pixmap_draw(c->area_backbase1, 0, 471);
+        lc_draw(c->area_backbase1,LC_CHAT, lc_x(LC_CHAT,0), lc_y(LC_CHAT,UI_BOTTOM(471)));
     }
 #endif
 
-    c->scene_delta = 0;
+    ui474_draw(c);
 }
 
 void client_handle_scroll_input(Client *c, int mouseX, int mouseY, int scrollableHeight, int height, bool redraw, int left, int top, Component *component) {
+    int previous_scroll=component->scrollPosition;
     if (c->scrollGrabbed) {
         c->scrollInputPadding = 32;
     } else {
@@ -8136,14 +9514,8 @@ void client_handle_scroll_input(Client *c, int mouseX, int mouseY, int scrollabl
 
     if (mouseX >= left && mouseX < left + 16 && mouseY >= top && mouseY < top + 16) {
         component->scrollPosition -= c->drag_cycles * 4;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
     } else if (mouseX >= left && mouseX < left + 16 && mouseY >= top + height - 16 && mouseY < top + height) {
         component->scrollPosition += c->drag_cycles * 4;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
     } else if (mouseX >= left - c->scrollInputPadding && mouseX < left + c->scrollInputPadding + 16 && mouseY >= top + 16 && mouseY < top + height - 16 && c->drag_cycles > 0) {
         int gripSize = (height - 32) * height / scrollableHeight;
         if (gripSize < 8) {
@@ -8152,11 +9524,13 @@ void client_handle_scroll_input(Client *c, int mouseX, int mouseY, int scrollabl
         int gripY = mouseY - top - gripSize / 2 - 16;
         int maxY = height - gripSize - 32;
         component->scrollPosition = (scrollableHeight - height) * gripY / maxY;
-        if (redraw) {
-            c->redraw_sidebar = true;
-        }
         c->scrollGrabbed = true;
     }
+    int max_scroll=scrollableHeight-height;if(max_scroll<0)max_scroll=0;
+    if(component->scrollPosition<0)component->scrollPosition=0;
+    if(component->scrollPosition>max_scroll)component->scrollPosition=max_scroll;
+    if(redraw&&component->scrollPosition!=previous_scroll)c->redraw_sidebar=true;
+
 }
 
 bool client_update_interface_animation(Client *c, int id, int delta) {
@@ -8299,7 +9673,7 @@ int client_execute_clientscript1(Client *c, Component *component, int scriptId) 
 }
 
 void projectFromGround(Client *c, PathingEntity *entity, int height) {
-    projectFromGround2(c, entity->x, height, entity->z);
+    projectFromGround2(c, entity->x, height-r16_player_visual_offset(&entity->entity), entity->z);
 }
 
 void projectFromGround2(Client *c, int x, int height, int z) {
@@ -8332,11 +9706,159 @@ void project(Client *c, int x, int y, int z) {
     dy = tmp;
 
     if (dz >= 50) {
-        c->projectX = _Pix3D.center_x + (dx << 9) / dz;
-        c->projectY = _Pix3D.center_y + (dy << 9) / dz;
+        c->projectX = _Pix3D.center_x + ve_screen((dx << 9) / dz);
+        c->projectY = _Pix3D.center_y + ve_screen((dy << 9) / dz);
     } else {
         c->projectX = -1;
         c->projectY = -1;
+    }
+}
+
+static int ve_native_markers(void) {
+#if defined(__vita__) && defined(GL11) && defined(VITA_NATIVE_WIDESCREEN)
+    return ve_enabled() && h4_world_enabled() && !h5_no_init();
+#else
+    return 0;
+#endif
+}
+
+/* Opt-in private diagnostic; removing the flag disables it for this run.
+ * Fixed output names only, no remote command interpreter or save edits. */
+static void ve_ui_probe(Client *c) {
+#if defined(__vita__) && defined(GL11)
+    static int enabled = -1, last_shot, last_flush;
+    static uint64_t last;
+    if (enabled < 0) {
+        enabled = 0; FILE *f = fopen("ux0:/data/RS2Vita/ui-probe.txt","r");
+        if (f) { fscanf(f,"%d",&enabled); fclose(f); }
+    }
+    if (!enabled) {ba_agility_probe_enabled=0;return;}
+    uint64_t now = rs2_now(); if (now-last < 1000) return; last = now;
+    FILE *f = fopen("ux0:/data/RS2Vita/ui-probe.txt","r");
+    int active = 0, shot = 0, fixture_probe=0, fields=0; if (f) { fields=fscanf(f,"%d %d %d",&active,&shot,&fixture_probe); fclose(f); }
+    /* FTP refresh may briefly expose an empty request; only an explicit zero disables this opt-in probe. */
+    if(fields<1){ba_agility_probe_enabled=0;return;}
+    if (!active) { enabled = 0;ba_agility_probe_enabled=0;return;}
+    ba_agility_probe_enabled=fixture_probe==5;
+#ifdef BUILD_A_EMBEDDED
+    if(shot<0&&shot!=last_flush){
+        extern void ba_cadence_probe_flush(void);
+        ba_cadence_probe_flush();last_flush=shot;
+        /* One explicit, opt-in geometry recapture request; no normal-play polling. */
+        if(fixture_probe==4)r16_dirty();
+    }
+#endif
+    int bx = -1, by = -1, hx = -1, hy = -1;
+    if (c->hint_type == 1 && c->hint_npc >= 0 && c->hint_npc < MAX_NPC_COUNT && c->npcs[c->hint_npc]) {
+        PathingEntity *npc = &c->npcs[c->hint_npc]->pathing_entity;
+        projectFromGround(c,npc,npc->height/2); bx = c->projectX; by = c->projectY;
+        projectFromGround(c,npc,npc->height+15); hx = c->projectX; hy = c->projectY;
+    }
+    if (shot > 0 && shot != last_shot) { last_shot = shot; r13_request_snapshot_token(shot); }
+    f = fopen("ux0:/data/RS2Vita/ui-observation.txt","w");
+    if (f) {
+        fprintf(f,"ingame=%d hint_type=%d hint_npc=%d body_x=%d body_y=%d head_x=%d head_y=%d mouse_x=%d mouse_y=%d picked=%d menu_size=%d view=%d chat=%d sticky=%d cross_mode=%d cross_cycle=%d shot=%d\n",
+            c->ingame,c->hint_type,c->hint_npc,bx,by,hx,hy,c->shell->mouse_x,c->shell->mouse_y,_Model.picked_count,c->menu_size,c->viewport_interface_id,c->chat_interface_id,c->sticky_chat_interface_id,c->cross_mode,c->cross_cycle,last_shot);
+        fprintf(f,"title_state=%d profile=%d field=%d username_length=%u new_player=%d\n",c->title_screen_state,title_theme_profile(),c->title_login_field,(unsigned)strlen(c->username),title_new_player);
+        {extern const char*platform_midi_current_track(void);fprintf(f,"music requested=%s loaded=%s enabled=%d delay=%d\n",c->currentMidi,platform_midi_current_track(),c->midiActive,c->nextMusicDelay);}
+        {extern void platform_midi_loop_status(unsigned out[3]);unsigned a[3];platform_midi_loop_status(a);fprintf(f,"music_loop repeats=%u enabled=%u duration_ms=%u\n",a[0],a[1],a[2]);}
+        {extern void r101_bloodworm_status(unsigned out[4]);unsigned a[4];r101_bloodworm_status(a);fprintf(f,"bloodworm_ground samples=%u adjusted=%u max_lift=%u penetrations=%u\n",a[0],a[1],a[2],a[3]);}
+        fprintf(f,"probe_projection=%d,%d,%d|%d,%d|%d,%d\n",c->cameraX,c->cameraY,c->cameraZ,c->cameraYaw,c->cameraPitch,_Pix3D.center_x,_Pix3D.center_y);
+        {extern void r16_door_probe_status(int out[3]);int status[3];r16_door_probe_status(status);fprintf(f,"door_probe=%d,%d,%d\n",status[0],status[1],status[2]);}
+        fprintf(f,"probe_camera=%d,%d,%d yaw=%d pitch=%d\n",_World3D.eyeX,_World3D.eyeY,_World3D.eyeZ,c->cameraYaw,c->cameraPitch);
+        fprintf(f,"tutorial flashing=%d selected=%d tick=%d\n",c->flashing_tab,c->selected_tab,_Client.loop_cycle);
+        char snapshot_path[256];const char*meta=h8_boot_path("ux0:/data/RS2Vita/minimap-shot.csv",snapshot_path,sizeof snapshot_path);
+        if(meta)fprintf(f,"snapshot_meta=%s\n",meta);
+        if(ba_agility_probe_enabled&&_SeqType.count>839&&_SeqType.instances[839]){SeqType*q=_SeqType.instances[839];int total=0;for(int i=0;i<q->frameCount;i++)total+=q->delay[i];fprintf(f,"agility_reference seq=839 frames=%d delays=%d first=%d last=%d\n",q->frameCount,total,q->frames[0],q->frames[q->frameCount-1]);}
+
+        {extern int platform_keyboard_is_open(void);fprintf(f,"keyboard_open=%d\n",platform_keyboard_is_open());}
+        if(c->local_player){PathingEntity*p=&c->local_player->pathing_entity;fprintf(f,"skill_animation seq=%d frame=%d cycle=%d delay=%d\n",p->primarySeqId,p->primarySeqFrame,p->primarySeqCycle,p->primarySeqDelay);}
+        fprintf(f,"xp_rate=%d\n",c->varps[323]);
+        {extern void r96_door_status(unsigned out[2]);unsigned counts[2];r96_door_status(counts);fprintf(f,"door_pose_transitions=%u door_animation_models=%u\n",counts[0],counts[1]);}
+        fprintf(f,"zone_status wilderness=%d arena=%d multi=%d\n",c->wildernessLevel,c->worldLocationState,c->in_multizone);
+        fprintf(f,"barrows_progress count=%d mask=%u\n",barrows_progress_count(c),c->varps?(unsigned)c->varps[R105_BARROWS_DEAD_VARP]&63u:0u);
+        fprintf(f,"scenery_speed rate=0.8 ambient_in=%llu ambient_out=%llu action_in=%llu action_out=%llu water_phase=%.6f\n",r106_ambient_input,r106_ambient_output,r106_action_input,r106_action_output,r106_water_offset(rs2_now()));
+        fprintf(f,"probe_time_us=%llu cadence_flush=%d\n",(unsigned long long)ba_timing_now(),last_flush);
+        fprintf(f,"world_bakes=%u roof_cache_swaps=%u\n",r16_bake_count(),r16_roof_swaps());
+        fprintf(f,"hull_layers replayed_triangles=%u\n",r16_hull_layers());
+        fprintf(f,"body_layers replayed_triangles=%u\n",r16_body_layer_faces());
+        fprintf(f,"audio_cost synth_calls=%llu synth_ms=%llu synth_max_ms=%llu play_calls=%llu play_ms=%llu play_max_ms=%llu\n",(unsigned long long)r94_audio_cost[0].calls,(unsigned long long)r94_audio_cost[0].total_ms,(unsigned long long)r94_audio_cost[0].max_ms,(unsigned long long)r94_audio_cost[1].calls,(unsigned long long)r94_audio_cost[1].total_ms,(unsigned long long)r94_audio_cost[1].max_ms);
+        {extern void platform_wave_status(unsigned out[6]);unsigned a[6];platform_wave_status(a);fprintf(f,"wave_output attempts=%u started=%u busy=%u failed=%u completed=%u nonzero_samples=%u metadata_calls=%llu\n",a[0],a[1],a[2],a[3],a[4],a[5],(unsigned long long)ba_resource_metadata_calls());}
+        for(int i=0;i<1000;i++)if(r108_sound_received[i])fprintf(f,"sound_event id=%d received=%u dispatched=%u\n",i,r108_sound_received[i],r108_sound_dispatched[i]);
+        fprintf(f,"map_decode_cache hits=%llu misses=%llu evictions=%llu bytes=%lu peak=%lu budget=%u\n",(unsigned long long)r109_hits,(unsigned long long)r109_misses,(unsigned long long)r109_evictions,(unsigned long)r109_bytes,(unsigned long)r109_peak,R109_BUDGET);
+        int crop_status[4];r16_crop_status(crop_status);fprintf(f,"crop_cache meshes=%d instances=%d source_vertices=%d gpu_bytes=%d\n",crop_status[0],crop_status[1],crop_status[2],crop_status[3]);
+        fprintf(f,"fixture_contacts replayed_triangles=%u\n",r16_fixture_contacts());
+        fprintf(f,"crane_mesh removed_duplicates=%u\n",r16_crane_duplicates());
+        fprintf(f,"ship_rail replayed_triangles=%u\n",r16_ship_rail_faces());
+        fprintf(f,"underground_seams clipped_models=%u\n",r16_underground_cuts());
+        int opening_status[3];r16_opening_status(opening_status);fprintf(f,"floor_openings triangles=%d clipped_tiles=%d overflow=%d\n",opening_status[0],opening_status[1],opening_status[2]);
+        int roof_status[8];r16_roof_status(roof_status);
+        fprintf(f,"roof_focus selected=%d level=%d components=%d buffers=%d uploads=%d failed=%d revision=%d hidden_indices=%d\n",roof_status[0],roof_status[1],roof_status[2],roof_status[3],roof_status[4],roof_status[5],roof_status[6],roof_status[7]);
+        if(!ve_enabled()){
+            fprintf(f,"classic_surface=%d,%d raster=%d,%d\n",c->area_viewport?c->area_viewport->width:0,c->area_viewport?c->area_viewport->height:0,_Pix2D.width,_Pix2D.height);
+            fputs("classic_cost",f);for(int i=0;i<DP_N;i++)fprintf(f," %s=%llu",dp_name[i],(unsigned long long)dp_frame_us[i]);fputc('\n',f);
+        }
+        fprintf(f,"context_visible=%d context_area=%d context_rect=%d,%d,%d,%d context_selected=%d context_overlay=%d\n",c->menu_visible,c->menu_area,c->menu_x,c->menu_y,c->menu_width,c->menu_height,c->vita_menu_selected,ve_menu_separate(c));
+        fprintf(f,"popup_reuses=%u popup_rasters=%u popup_reason=%d popup_bytes=%u popup_diff=%d,%d\n",popup_reuses,popup_rasters,popup_reason,(unsigned)popup_now_n,popup_diff_component,popup_diff_relative);
+        fprintf(f,"popup_cpu_us chat=%llu compose=%llu clear=%llu flush=%llu state=%llu\n",(unsigned long long)popup_chat_us,(unsigned long long)popup_compose_us,(unsigned long long)popup_clear_us,(unsigned long long)popup_flush_us,(unsigned long long)popup_state_us);
+        fprintf(f,"effect_allocations=%u effect_resizes=%u effect_cpu_bytes=%u\n",ve_effect_allocations,ve_effect_resizes,(unsigned)ve_effect_bytes);
+        for (int i = 0; i < c->menu_size && i < 20; i++) fprintf(f,"menu[%d]=%d|%s\n",i,c->menu_action[i],c->menu_option[i]);
+        if(fixture_probe&&c->ingame&&c->scene_state==2&&c->local_player&&c->scene){
+         int ax=c->local_player->pathing_entity.x/128,az=c->local_player->pathing_entity.z/128;
+         fprintf(f,"scene_base=%d,%d player=%d,%d yaw=%d pitch=%d run=%d energy=%d map_angle=%d map_zoom=%d\n",c->sceneBaseTileX,c->sceneBaseTileZ,c->sceneBaseTileX+ax,c->sceneBaseTileZ+az,c->orbit_camera_yaw,c->orbit_camera_pitch,c->varps?c->varps[173]:0,c->energy,c->minimap_anticheat_angle,c->minimap_zoom);
+         for(int x=ax-8;x<=ax+8;x++)for(int z=az-8;z<=az+8;z++){
+          if(x<0||z<0||x>=c->scene->maxTileX||z>=c->scene->maxTileZ)continue;Ground*t=c->scene->levelTiles[c->currentLevel][x][z];if(!t)continue;
+          if(t->wall&&r16_live_door(t->wall->bitset)){
+           Wall*w=t->wall;int id=((unsigned)w->bitset>>14)&32767;LocType*type=loctype_get(id);Model*model=w->modelA?w->modelA:w->modelB;
+           projectFromGround2(c,w->x,model?model->max_y/2:0,w->z);
+           fprintf(f,"door=%d|%s|%d,%d|%d,%d\n",id,type->name?type->name:"",c->sceneBaseTileX+x,c->sceneBaseTileZ+z,c->projectX,c->projectY);
+           fprintf(f,"door_geometry=%d|%d,%d|%d,%d,%d|%d,%d,%d\n",id,c->sceneBaseTileX+x,c->sceneBaseTileZ+z,w->x,w->y,w->z,model?model->face_count:0,model?model->max_y:0,model?model->min_y:0);
+           if(model&&((id>=3851&&id<=3882)||(id>=3907&&id<4035))&&model->face_count>=498){
+            for(int face=63;face<=64;face++){
+             int a=model->face_indices_a[face],b=model->face_indices_b[face],d=model->face_indices_c[face];
+             fprintf(f,"door_top=%d|%d,%d|%d|%d,%d,%d,%d|%d,%d,%d|%d,%d,%d|%d,%d,%d\n",id,c->sceneBaseTileX+x,c->sceneBaseTileZ+z,face,model->face_infos?model->face_infos[face]:0,model->face_color_a?model->face_color_a[face]:-1,model->face_color_b?model->face_color_b[face]:-1,model->face_color_c?model->face_color_c[face]:-1,model->vertices_x[a],model->vertices_y[a],model->vertices_z[a],model->vertices_x[b],model->vertices_y[b],model->vertices_z[b],model->vertices_x[d],model->vertices_y[d],model->vertices_z[d]);
+            }
+           }
+          }
+          for(int j=0;j<t->locCount;j++){
+           Location*l=t->locs[j];if(!l||l->r10_temporary||!l->model||l->minSceneTileX!=x||l->minSceneTileZ!=z||!r16_live_location(l->bitset))continue;
+           int id=((unsigned)l->bitset>>14)&32767;LocType*type=loctype_get(id);projectFromGround2(c,l->x,l->model->max_y/2,l->z);
+           fprintf(f,"fixture=%d|%s|%d,%d|%d,%d\n",id,type->name?type->name:"",c->sceneBaseTileX+x,c->sceneBaseTileZ+z,c->projectX,c->projectY);
+          }
+         }
+         for(int i=0;i<c->npc_count;i++){
+          int slot=c->npc_ids[i];NpcEntity*n=c->npcs[slot];if(!n||!n->type)continue;
+          projectFromGround(c,&n->pathing_entity,n->pathing_entity.height/2);
+          fprintf(f,"npc=%d|%lld|%s|%d,%d|%d,%d\n",slot,(long long)n->type->index,n->type->name?n->type->name:"",c->sceneBaseTileX+n->pathing_entity.x/128,c->sceneBaseTileZ+n->pathing_entity.z/128,c->projectX,c->projectY);
+          fprintf(f,"npc_facing=%d|%lld|%d,%d|%d,%d|%d,%d|%d\n",slot,(long long)n->type->index,n->pathing_entity.yaw,n->pathing_entity.dstYaw,n->pathing_entity.lastFaceX,n->pathing_entity.lastFaceZ,n->pathing_entity.targetTileX,n->pathing_entity.targetTileZ,n->pathing_entity.targetId);
+         }
+         for(int i=0;i<5;i++)fprintf(f,"message=%d|%s\n",i,c->message_text[i]);
+         Component*inv=_Component.instances[3214];if(inv)for(int i=0;i<28;i++)fprintf(f,"inventory=%d|%d|%d\n",i,inv->invSlotObjId[i]-1,inv->invSlotObjCount[i]);
+        }
+        fclose(f);
+    }
+#else
+    (void)c;
+#endif
+}
+
+static void ve_draw_world_markers(Client *c) {
+    if (!ve_native_markers()) return;
+    if (c->cross_mode == 1 || c->cross_mode == 2) {
+        int frame = c->cross_cycle/100 + (c->cross_mode == 2 ? 4 : 0);
+        if (frame >= 0 && frame < 8) ve_world_sprite(c->image_crosses[frame],c->crossX-8,c->crossY-8);
+    }
+    if (_Client.loop_cycle % 20 >= 10) return;
+    if (c->hint_type == 1 && c->hint_npc >= 0 && c->hint_npc < MAX_NPC_COUNT) {
+        NpcEntity *npc = c->npcs[c->hint_npc];
+        if (npc && pathingentity_is_visible(&npc->pathing_entity)) {
+            projectFromGround(c,&npc->pathing_entity,npc->pathing_entity.height+15);
+            if (c->projectX >= 0) ve_world_sprite(c->image_headicons[2],c->projectX-12,c->projectY-28);
+        }
+    } else if (c->hint_type == 2) {
+        projectFromGround2(c,((c->hint_tile_x-c->sceneBaseTileX)<<7)+c->hint_offset_x,c->hint_height*2,
+            ((c->hint_tile_z-c->sceneBaseTileZ)<<7)+c->hint_offset_z);
+        if (c->projectX >= 0) ve_world_sprite(c->image_headicons[2],c->projectX-12,c->projectY-28);
     }
 }
 
@@ -8488,7 +10010,7 @@ static void draw2DEntityElements(Client *c) {
                 if (c->projectX > -1) {
                     for (int icon = 0; icon < 8; icon++) {
                         if ((player->headicons & 0x1 << icon) != 0) {
-                            pix24_draw(c->image_headicons[icon], c->projectX - 12, c->projectY - y);
+                            if(ve_native_markers())ve_world_sprite(c->image_headicons[icon], c->projectX - 12, c->projectY - y);else pix24_draw(c->image_headicons[icon], c->projectX - 12, c->projectY - y);
                             y -= 25;
                         }
                     }
@@ -8498,10 +10020,10 @@ static void draw2DEntityElements(Client *c) {
             if (index >= 0 && c->hint_type == 10 && c->hint_player == c->player_ids[index]) {
                 projectFromGround(c, entity, entity->height + 15);
                 if (c->projectX > -1) {
-                    pix24_draw(c->image_headicons[7], c->projectX - 12, c->projectY - y);
+                    if(ve_native_markers())ve_world_sprite(c->image_headicons[7], c->projectX - 12, c->projectY - y);else pix24_draw(c->image_headicons[7], c->projectX - 12, c->projectY - y);
                 }
             }
-        } else if (c->hint_type == 1 && c->hint_npc == c->npc_ids[index - c->player_count] && _Client.loop_cycle % 20 < 10) {
+        } else if (!ve_native_markers() && c->hint_type == 1 && c->hint_npc == c->npc_ids[index - c->player_count] && _Client.loop_cycle % 20 < 10) {
             projectFromGround(c, entity, entity->height + 15);
             if (c->projectX > -1) {
                 pix24_draw(c->image_headicons[2], c->projectX - 12, c->projectY - 28);
@@ -8541,8 +10063,8 @@ static void draw2DEntityElements(Client *c) {
                 if (w > 30) {
                     w = 30;
                 }
-                pix2d_fill_rect(c->projectX - 15, c->projectY - 3, GREEN, w, 5);
-                pix2d_fill_rect(c->projectX - 15 + w, c->projectY - 3, RED, 30 - w, 5);
+                if(ve_native_markers()){ve_world_rect(c->projectX-15,c->projectY-3,w,5,GREEN);ve_world_rect(c->projectX-15+w,c->projectY-3,30-w,5,RED);}
+                else {pix2d_fill_rect(c->projectX - 15, c->projectY - 3, GREEN, w, 5);pix2d_fill_rect(c->projectX - 15 + w, c->projectY - 3, RED, 30 - w, 5);}
             }
         }
 
@@ -8550,11 +10072,15 @@ static void draw2DEntityElements(Client *c) {
             projectFromGround(c, entity, entity->height / 2);
 
             if (c->projectX > -1) {
-                pix24_draw(c->image_hitmarks[entity->damageType], c->projectX - 12, c->projectY - 12);
+                if(ve_native_markers())ve_world_sprite(c->image_hitmarks[entity->damageType], c->projectX - 12, c->projectY - 12);else pix24_draw(c->image_hitmarks[entity->damageType], c->projectX - 12, c->projectY - 12);
+                int hit_x=c->projectX,hit_y=c->projectY;Pix2D hit_saved=_Pix2D;
+                PixMap*hit_pm=ve_native_markers()?ve_effect_surface(MAX_CHATS+1+((index+1)%8),32,24):NULL;
+                if(hit_pm){c->projectX=16;c->projectY=12;}
                 char *damage = valueof(entity->damage);
                 drawStringCenter(c->font_plain11, c->projectX, c->projectY + 4, damage, BLACK);
                 drawStringCenter(c->font_plain11, c->projectX - 1, c->projectY + 3, damage, WHITE);
                 free(damage);
+                if(hit_pm){ve_effect_finish(hit_pm,hit_saved,hit_x-16,hit_y-12);c->projectX=hit_x;c->projectY=hit_y;}
             }
         }
     }
@@ -8588,19 +10114,23 @@ static void draw2DEntityElements(Client *c) {
         c->projectX = c->chatX[i];
         c->projectY = c->chatY[i] = y;
         const char *message = c->chats[i];
+        int speech_x=c->projectX,speech_y=c->projectY;Pix2D speech_saved=_Pix2D;
+        int speech_w=1024,speech_h=48;
+        PixMap*speech_pm=ve_native_markers()?ve_effect_surface(i,speech_w,speech_h):NULL;
+        if(speech_pm){c->projectX=speech_pm->width/2;c->projectY=height+12;}
         if (c->chatEffects == 0) {
             int color = YELLOW;
             if (c->chatColors[i] < 6) {
                 color = CHAT_COLORS[c->chatColors[i]];
             }
             if (c->chatColors[i] == 6) {
-                color = c->scene_cycle % 20 < 10 ? RED : YELLOW;
+                color = _Client.loop_cycle % 20 < 10 ? RED : YELLOW;
             }
             if (c->chatColors[i] == 7) {
-                color = c->scene_cycle % 20 < 10 ? BLUE : CYAN;
+                color = _Client.loop_cycle % 20 < 10 ? BLUE : CYAN;
             }
             if (c->chatColors[i] == 8) {
-                color = c->scene_cycle % 20 < 10 ? 0xb000 : 0x80ff80;
+                color = _Client.loop_cycle % 20 < 10 ? 0xb000 : 0x80ff80;
             }
             if (c->chatColors[i] == 9) {
                 int delta = 150 - c->chatTimers[i];
@@ -8637,13 +10167,13 @@ static void draw2DEntityElements(Client *c) {
                 drawStringCenter(c->font_bold12, c->projectX, c->projectY, message, color);
             }
             if (c->chatStyles[i] == 1) {
-                drawCenteredWave(c->font_bold12, c->projectX, c->projectY + 1, message, BLACK, c->scene_cycle);
-                drawCenteredWave(c->font_bold12, c->projectX, c->projectY, message, color, c->scene_cycle);
+                drawCenteredWave(c->font_bold12, c->projectX, c->projectY + 1, message, BLACK, _Client.loop_cycle);
+                drawCenteredWave(c->font_bold12, c->projectX, c->projectY, message, color, _Client.loop_cycle);
             }
             if (c->chatStyles[i] == 2) {
                 int w = stringWidth(c->font_bold12, message);
                 int offsetX = (150 - c->chatTimers[i]) * (w + 100) / 150;
-                pix2d_set_clipping(334, c->projectX + 50, 0, c->projectX - 50);
+                pix2d_set_clipping(GAME_VIEW_HEIGHT, c->projectX + 50, 0, c->projectX - 50);
                 drawString(c->font_bold12, c->projectX + 50 - offsetX, c->projectY + 1, message, BLACK);
                 drawString(c->font_bold12, c->projectX + 50 - offsetX, c->projectY, message, color);
                 pix2d_reset_clipping();
@@ -8652,10 +10182,14 @@ static void draw2DEntityElements(Client *c) {
             drawStringCenter(c->font_bold12, c->projectX, c->projectY + 1, message, BLACK);
             drawStringCenter(c->font_bold12, c->projectX, c->projectY, message, YELLOW);
         }
+        if(speech_pm){ve_effect_finish(speech_pm,speech_saved,speech_x-speech_pm->width/2,speech_y-height-12);c->projectX=speech_x;c->projectY=speech_y;}
+        else if(ve_native_markers())c->redraw_sidebar=true;
     }
+    if(ve_native_markers())for(int i=c->chatCount;i<MAX_CHATS;i++)if(ve_effect_pm[i]){PixMap*p=ve_effect_pm[i];ve_effect_bytes-=(size_t)p->width*p->height*12;pixmap_free(p);ve_effect_pm[i]=NULL;}
 }
 
 static void drawTileHint(Client *c) {
+    if (ve_native_markers()) return;
     if (c->hint_type != 2) {
         return;
     }
@@ -8668,6 +10202,7 @@ static void drawTileHint(Client *c) {
 }
 
 static void updateTextures(Client *c, int cycle) {
+    ba_timing_record(BA_TEXTURE,0);
     if (!_Client.lowmem) {
         if (_Pix3D.textureCycle[17] >= cycle) {
             Pix8 *texture = _Pix3D.textures[17];
@@ -8700,6 +10235,22 @@ static void updateTextures(Client *c, int cycle) {
             c->textureBuffer = src;
             pix3d_push_texture(24);
         }
+        if (_Pix3D.textureCycle[50] >= cycle) {
+            Pix8 *texture = _Pix3D.textures[50];
+            int bottom = texture->width * texture->height - 1;
+            int adjustment = texture->width * c->scene_delta * 2;
+
+            int8_t *src = texture->pixels;
+            int8_t *dst = c->textureBuffer;
+            for (int i = 0; i <= bottom; i++) {
+                dst[i] = src[i - adjustment & bottom];
+            }
+
+            texture->pixels = dst;
+            c->textureBuffer = src;
+            pix3d_push_texture(50);
+        }
+
     }
 }
 
@@ -8761,7 +10312,8 @@ static void drawPrivateMessages(Client *c) {
     }
 }
 
-static void drawWildyLevel(Client *c) {
+static void updateWorldLocationState(Client *c) {
+    if(!c->local_player){c->wildernessLevel=c->worldLocationState=c->overrideChat=0;return;}
     int x = (c->local_player->pathing_entity.x >> 7) + c->sceneBaseTileX;
     int z = (c->local_player->pathing_entity.z >> 7) + c->sceneBaseTileZ;
 
@@ -8809,6 +10361,35 @@ static void drawWildyLevel(Client *c) {
     }
 }
 
+/* Region indicators are transient GPU content, like speech and click marks.
+ * They cannot be retained in the UI texture after leaving their region. */
+static int barrows_progress_count(Client*c){
+ if(!c->ingame||c->scene_state!=2||!c->local_player||!c->varps)return -1;
+ return r105_barrows_count(c->sceneBaseTileX+c->local_player->pathing_entity.x/128,c->sceneBaseTileZ+c->local_player->pathing_entity.z/128,c->currentLevel,(unsigned)c->varps[R105_BARROWS_DEAD_VARP]);
+}
+static void ve_draw_barrows_progress(Client*c){
+ if(!ve_native_markers())return;
+ int count=barrows_progress_count(c);if(count<0)return;
+ static int last=-1;PixMap*p=ve_effect_pm[MAX_CHATS+11];Pix2D saved=_Pix2D;
+ if(!p||last!=count){p=ve_effect_surface(MAX_CHATS+11,176,18);if(!p){_Pix2D=saved;return;}
+  char text[48];snprintf(text,sizeof text,"Brothers slain: %d/6",count);
+  drawStringCenter(c->font_plain12,88,14,text,YELLOW);p->dirty=true;last=count;
+ }
+ ve_effect_finish(p,saved,744,184);
+}
+
+static void ve_draw_location_status(Client*c){
+ if(!ve_native_markers()||!c->ingame||c->scene_state!=2||!c->local_player)return;
+ updateWorldLocationState(c);
+ if(c->wildernessLevel<=0&&c->worldLocationState!=1&&c->in_multizone!=1)return;
+ Pix2D saved=_Pix2D;PixMap*p=ve_effect_surface(MAX_CHATS+10,64,96);if(!p){_Pix2D=saved;return;}
+ if(c->in_multizone==1)pix24_draw(c->image_headicons[1],20,(c->wildernessLevel>0||c->worldLocationState==1)?8:46);
+ char text[HALF_STR];
+ if(c->wildernessLevel>0){pix24_draw(c->image_headicons[0],20,46);sprintf(text,"Level: %d",c->wildernessLevel);drawStringCenter(c->font_plain12,32,79,text,YELLOW);}
+ if(c->worldLocationState==1){pix24_draw(c->image_headicons[6],20,46);drawStringCenter(c->font_plain12,32,79,"Arena",YELLOW);}
+ ve_effect_finish(p,saved,452,250);
+}
+
 static void drawTooltip(Client *c) {
     if (c->menu_size < 2 && c->obj_selected == 0 && c->spell_selected == 0) {
         return;
@@ -8829,33 +10410,41 @@ static void drawTooltip(Client *c) {
         sprintf(tooltip, "%s@whi@ / %d more options", tmp, (c->menu_size - 2));
     }
 
+    if(ve_native_markers()){
+        Pix2D saved=_Pix2D;PixMap*p=ve_effect_surface(MAX_CHATS,960,32);
+        if(p){drawStringTooltip(c->font_bold12,4,15,tooltip,WHITE,true,_Client.loop_cycle/1000);ve_effect_finish(p,saved,0,0);return;}
+        _Pix2D=saved;
+    }
     drawStringTooltip(c->font_bold12, 4, 15, tooltip, WHITE, true, _Client.loop_cycle / 1000);
 }
 
 static void draw3DEntityElements(Client *c) {
     drawPrivateMessages(c);
-    if (c->cross_mode == 1) {
+    if (!ve_native_markers() && c->cross_mode == 1) {
         pix24_draw(c->image_crosses[c->cross_cycle / 100], c->crossX - 8 - 8, c->crossY - 8 - 11);
     }
 
-    if (c->cross_mode == 2) {
+    if (!ve_native_markers() && c->cross_mode == 2) {
         pix24_draw(c->image_crosses[c->cross_cycle / 100 + 4], c->crossX - 8 - 8, c->crossY - 8 - 11);
     }
 
     if (c->viewport_interface_id != -1) {
-        client_update_interface_animation(c, c->viewport_interface_id, c->scene_delta);
-        client_draw_interface(c, _Component.instances[c->viewport_interface_id], 0, 0, 0);
+        if (!ve_anim_advanced) client_update_interface_animation(c, c->viewport_interface_id, c->scene_delta);
+        client_draw_interface(c, _Component.instances[c->viewport_interface_id], (ve_enabled()?224:GAME_MODAL_X)+client_modal_offset(c,c->viewport_interface_id,ve_enabled()), client_modal_y(c,c->viewport_interface_id,ve_enabled()), 0);
     }
 
-    drawWildyLevel(c);
+    updateWorldLocationState(c);
 
     if (!c->menu_visible) {
-        client_handle_input(c);
-        drawTooltip(c);
+        if (!ve_input_advanced) client_handle_input(c);
+        if(!ve_native_markers())drawTooltip(c);
     } else if (c->menu_area == 0) {
         client_draw_menu(c);
     }
 
+    char buf[HALF_STR];
+    if(!ve_native_markers()){
+    {int count=barrows_progress_count(c);if(count>=0){char text[48];snprintf(text,sizeof text,"Brothers slain: %d/6",count);drawStringRight(c->font_plain12,507,160,text,YELLOW,true);}}
     if (c->in_multizone == 1) {
         if (c->wildernessLevel > 0 || c->worldLocationState == 1) {
             pix24_draw(c->image_headicons[1], 472, 258);
@@ -8864,7 +10453,6 @@ static void draw3DEntityElements(Client *c) {
         }
     }
 
-    char buf[HALF_STR];
     if (c->wildernessLevel > 0) {
         pix24_draw(c->image_headicons[0], 472, 296);
         sprintf(buf, "Level: %d", c->wildernessLevel);
@@ -8874,6 +10462,8 @@ static void draw3DEntityElements(Client *c) {
     if (c->worldLocationState == 1) {
         pix24_draw(c->image_headicons[6], 472, 296);
         drawStringCenter(c->font_plain12, 484, 329, "Arena", YELLOW);
+    }
+
     }
 
     if (c->system_update_timer != 0) {
@@ -8890,11 +10480,19 @@ static void draw3DEntityElements(Client *c) {
         }
     }
 
-    draw_info_overlay(c);
+    if(!ve_native_markers()||_Custom.camera_editor||_Custom.show_debug)draw_info_overlay(c);
 }
 
+static void pushNpcsPriority(Client *c, bool priority);
+
 void client_draw_scene(Client *c) {
+    updateWorldLocationState(c);
+    dp_switch(DP_ENTITY);
+    H3Scope h3_entity=h3_enter(H3_ENTITY);h3_link(&h3_entity);
+    uint64_t entity_started=ba_timing_now();
+    ba_timing_record(BA_SCENE_CONSUMED,(uint64_t)c->scene_delta);
     c->scene_cycle++;
+    pushNpcsPriority(c, true);
     pushPlayers(c);
     pushNpcs(c);
     pushProjectiles(c);
@@ -8904,6 +10502,9 @@ void client_draw_scene(Client *c) {
     pushLocs(c);
 #endif
 
+    h3_leave(&h3_entity);
+    ba_timing_record(BA_ENTITY_PREP,ba_timing_now()-entity_started);
+    dp_switch(DP_ORBIT);
     if (!c->cutscene) {
         int pitch = c->orbit_camera_pitch;
 
@@ -8943,6 +10544,19 @@ void client_draw_scene(Client *c) {
         }
     }
 
+    if (getenv("BUILD_A_MAP_TRACE")) {
+        static bool traced_map_state = false;
+        if (!traced_map_state) {
+            traced_map_state = true;
+            int player_x = c->local_player ? c->local_player->pathing_entity.x : -1;
+            int player_z = c->local_player ? c->local_player->pathing_entity.z : -1;
+            rs2_log("BUILD_A_MAP_TRACE camera=%d,%d,%d player=%d,%d level=%d base=%d,%d center=%d,%d scene=%d\n",
+                    c->cameraX, c->cameraY, c->cameraZ, player_x, player_z,
+                    c->currentLevel, c->sceneBaseTileX, c->sceneBaseTileZ,
+                    c->sceneCenterZoneX, c->sceneCenterZoneZ, c->scene_state);
+        }
+    }
+
     int level;
     if (c->cutscene) {
         level = getTopLevelCutscene(c);
@@ -8958,7 +10572,7 @@ void client_draw_scene(Client *c) {
     int jitter;
     for (int type = 0; type < 5; type++) {
         if (c->cameraModifierEnabled[type]) {
-            jitter = (int)(jrand() * (DOUBLE)(c->cameraModifierJitter[type] * 2 + 1) - (DOUBLE)c->cameraModifierJitter[type] + SIN((DOUBLE)c->cameraModifierCycle[type] * ((DOUBLE)c->cameraModifierWobbleSpeed[type] / 100.0)) * (DOUBLE)c->cameraModifierWobbleScale[type]);
+            jitter = (int)(jrand() * (double)(c->cameraModifierJitter[type] * 2 + 1) - (double)c->cameraModifierJitter[type] + sin((double)c->cameraModifierCycle[type] * ((double)c->cameraModifierWobbleSpeed[type] / 100.0)) * (double)c->cameraModifierWobbleScale[type]);
             if (type == 0) {
                 c->cameraX += jitter;
             }
@@ -8983,48 +10597,75 @@ void client_draw_scene(Client *c) {
         }
     }
     jitter = _Pix3D.cycle;
-    _Model.check_hover = true;
+    _Model.check_hover = ((ve_enabled()?ve_world_input(c->shell->mouse_x,c->shell->mouse_y):game_world_input(c->shell->mouse_x,c->shell->mouse_y))&&!lc_game_covers(c->shell->mouse_x,c->shell->mouse_y)) && c->viewport_interface_id == -1;
     _Model.picked_count = 0;
-    _Model.mouse_x = c->shell->mouse_x - 8;
-    _Model.mouse_y = c->shell->mouse_y - 11;
-    pix2d_clear();
+    _Model.mouse_x = ve_pointer(_Pix3D.center_x, c->shell->mouse_x - (ve_enabled()?0:8));
+    _Model.mouse_y = ve_pointer(_Pix3D.center_y, c->shell->mouse_y - (ve_enabled()?0:11));
+    int ve_hold_overlay=ve_enabled() && (ve_popup_frame || !ve_ui_dirty(c));
+    ve_overlay_held_frame=ve_hold_overlay;
+    if(!ve_hold_overlay)pix2d_clear();
 
     gl_start_drawscene();
 
     // NOTE rm these
     char buf[MAX_STR];
     uint64_t last = rs2_now();
-    world3d_draw(c->scene, c->cameraX, c->cameraY, c->cameraZ, level, c->cameraYaw, c->cameraPitch, _Client.loop_cycle);
-    if (_Custom.show_performance) {
+    dp_switch(DP_WORLD);
+    uint64_t raster_started=ba_timing_now();
+    void r16_set_anchor(int tile_x, int tile_z);
+    r16_set_scene_region(c->sceneBaseTileZ);
+    if (c->local_player) {
+        r16_set_anchor(c->local_player->pathing_entity.x / 128, c->local_player->pathing_entity.z / 128);
+        r16_set_roof_focus(c->levelTileFlags,c->currentLevel,c->local_player->pathing_entity.x/128,c->local_player->pathing_entity.z/128);
+    }
+    if(h4_world_enabled()){H3_SCOPE(H3_WORLD);h4_world_enter();world3d_draw(c->scene, c->cameraX, c->cameraY, c->cameraZ, level, c->cameraYaw, c->cameraPitch, _Client.loop_cycle);}
+    else {gl_discard_geometry();ba_profile_scene(world3d_draw_radius(),c->cameraX/128,c->cameraZ/128,c->cameraYaw,c->cameraPitch,0,0);}
+    h4_context(world3d_draw_radius(),c->cameraX,c->cameraY,c->cameraZ,c->cameraYaw,c->cameraPitch,c->sceneBaseTileX+c->local_player->pathing_entity.x/128,c->sceneBaseTileZ+c->local_player->pathing_entity.z/128,c->scene_state==2);
+    ba_timing_record(BA_WORLD_RASTER,ba_timing_now()-raster_started);
+    dp_switch(DP_POST);
+    if(ve_enabled())ve_hud_scene_metrics((int)(rs2_now()-last),-1);
+    if (!ve_enabled() && _Custom.show_performance && !ve_hold_overlay) {
         sprintf(buf, "World3D: %lu ms", rs2_now() - last);
-        drawStringRight(c->font_plain11, 507, 200, buf, YELLOW, true);
+        drawStringRight(c->font_plain11, PERF_RIGHT(507), PERF_BASELINE(200), classic_perf_display(2,buf), YELLOW, true);
     }
 
-    gl_end_drawscene(c);
+    if(h4_world_enabled()){H3_SCOPE(H3_SUBMIT);gl_end_drawscene(c);}
+    if (ve_enabled()) {
+        /* Consume this frame's pick results even while the UI is retained. */
+        if (!c->menu_visible) client_handle_input(c);
+        ve_input_advanced = 1;
+        ve_draw_world_markers(c);
+        draw2DEntityElements(c);
+        if(!c->menu_visible)drawTooltip(c);
+        ve_ui_probe(c);
+    }
 
+
+    H3Scope h3_post=h3_enter(H3_POST_WORLD);h3_link(&h3_post);
     world3d_clear_temporarylocs(c->scene);
-    draw2DEntityElements(c);
-    drawTileHint(c);
     updateTextures(c, jitter);
+    if(!ve_hold_overlay){
+    dp_switch(DP_OV2D);
+    if(!ve_native_markers())draw2DEntityElements(c);
+    dp_switch(DP_OVHINT);
+    drawTileHint(c);
+    dp_switch(DP_OV3D);
     draw3DEntityElements(c);
+    dp_switch(DP_POST);
+    }
 
     static uint64_t pixmap_now;
     static uint64_t pixmap_last;
-    if (_Custom.show_performance) {
+    if(ve_enabled())ve_hud_scene_metrics(-1,(int)(pixmap_now-pixmap_last));
+    if (!ve_enabled() && _Custom.show_performance && !ve_hold_overlay) {
         sprintf(buf, "Viewport pixmap: %lu ms", pixmap_now - pixmap_last);
-#ifdef GL11
-        extern bool use_opengl11; // use global use_opengl11 as gl_end_drawscene force disables it
-        if (use_opengl11) {
-            extern int pixcount;
-            sprintf(buf, "%s, pixcount %d", buf, pixcount);
-        }
-#endif
-        drawStringRight(c->font_plain11, 507, 213, buf, YELLOW, true);
+        drawStringRight(c->font_plain11, PERF_RIGHT(507), PERF_BASELINE(213), classic_perf_display(3,buf), YELLOW, true);
     }
     pixmap_last = rs2_now();
-    pixmap_draw(c->area_viewport, 8, 11);
+    if(!ve_enabled())pixmap_draw(c->area_viewport, 8, 11);
     pixmap_now = rs2_now();
 
+    h3_leave(&h3_post);
     c->cameraX = cameraX;
     c->cameraY = cameraY;
     c->cameraZ = cameraZ;
@@ -9168,9 +10809,15 @@ void orbitCamera(Client *c, int targetX, int targetY, int targetZ, int yaw, int 
 }
 
 void pushLocs(Client *c) {
+    r10_animation_update(1);
     for (LocEntity *loc = (LocEntity *)linklist_head(c->locList); loc; loc = (LocEntity *)linklist_next(c->locList)) {
         bool append = false;
-        loc->seqCycle += c->scene_delta;
+        int visual_delta=r106_scenery_delta(c->scene_delta,loc->ambient_half,&loc->ambient_remainder);
+        if(c->scene_delta>0){
+            if(loc->ambient_half){r106_ambient_input+=(unsigned)c->scene_delta;r106_ambient_output+=(unsigned)visual_delta;}
+            else{r106_action_input+=(unsigned)c->scene_delta;r106_action_output+=(unsigned)visual_delta;}
+        }
+        loc->seqCycle += visual_delta;
         if (loc->seqFrame == -1) {
             loc->seqFrame = 0;
             append = true;
@@ -9268,6 +10915,7 @@ void pushLocs(Client *c) {
             }
         }
     }
+    r10_animation_update(0);
 }
 
 void pushSpotanims(Client *c) {
@@ -9319,12 +10967,17 @@ void pushProjectiles(Client *c) {
     }
 }
 
-void pushNpcs(Client *c) {
+void pushNpcs(Client *c) { pushNpcsPriority(c, false); }
+
+static void pushNpcsPriority(Client *c, bool priority) {
+    extern void r101_bloodworm_scene_probe(const NpcEntity*,int,int,int,int);
     for (int i = 0; i < c->npc_count; i++) {
         NpcEntity *npc = c->npcs[c->npc_ids[i]];
         int bitset = (c->npc_ids[i] << 14) + 0x20000000;
 
-        if (!npc || !npcentity_is_visible(npc)) {
+        if (!npc || !npcentity_is_visible(npc) || npc->type->alwaysontop != priority) {
+            if(npc&&npc->type&&npc->type->index==1049&&npc->type->alwaysontop==priority)r101_bloodworm_scene_probe(npc,c->npc_ids[i],c->scene_cycle,_Client.loop_cycle,1);
+            if(npc&&npc->type&&npc->type->alwaysontop==priority)recovery_npc_trace(c,npc,c->npc_ids[i],"SCENE",1);
             continue;
         }
 
@@ -9332,17 +10985,22 @@ void pushNpcs(Client *c) {
         int z = npc->pathing_entity.z >> 7;
 
         if (x < 0 || x >= 104 || z < 0 || z >= 104) {
+            if(npc->type->index==1049)r101_bloodworm_scene_probe(npc,c->npc_ids[i],c->scene_cycle,_Client.loop_cycle,3);
             continue;
         }
 
         if (npc->pathing_entity.size == 1 && (npc->pathing_entity.x & 0x7f) == 64 && (npc->pathing_entity.z & 0x7f) == 64) {
             if (c->tileLastOccupiedCycle[x][z] == c->scene_cycle) {
+                if(npc->type->index==1049)r101_bloodworm_scene_probe(npc,c->npc_ids[i],c->scene_cycle,_Client.loop_cycle,2);
+                recovery_npc_trace(c,npc,c->npc_ids[i],"SCENE",2);
                 continue;
             }
 
             c->tileLastOccupiedCycle[x][z] = c->scene_cycle;
         }
 
+        recovery_npc_trace(c,npc,c->npc_ids[i],"SCENE",0);
+        if(npc->type->index==1049)r101_bloodworm_scene_probe(npc,c->npc_ids[i],c->scene_cycle,_Client.loop_cycle,0);
         world3d_add_temporary(c->scene, c->currentLevel, npc->pathing_entity.x, getHeightmapY(c, c->currentLevel, npc->pathing_entity.x, npc->pathing_entity.z), npc->pathing_entity.z, NULL, &npc->pathing_entity.entity, bitset, npc->pathing_entity.yaw, (npc->pathing_entity.size - 1) * 64 + 60, npc->pathing_entity.seqStretches);
     }
 }
@@ -9396,11 +11054,14 @@ void pushPlayers(Client *c) {
 
 void client_draw_minimap(Client *c) {
     pixmap_bind(c->area_mapback);
+    /* Enhanced fills the full map source. Restore Classic artwork before its circular draw. */
+    if (!ve_enabled()) pix8_draw(c->image_mapback, 0, 0);
     int angle = c->orbit_camera_yaw + c->minimap_anticheat_angle & 0x7ff;
     int anchorX = c->local_player->pathing_entity.x / 32 + 48;
     int anchorY = 464 - c->local_player->pathing_entity.z / 32;
 
-    pix24_draw_rotated_masked(c->image_minimap, 21, 9, 146, 151, c->minimap_mask_line_offsets, c->minimap_mask_line_lengths, anchorX, anchorY, angle, c->minimap_zoom + 256);
+    int full_offsets[151]={0},full_lengths[151];for(int row=0;row<151;row++)full_lengths[row]=146;
+    pix24_draw_rotated_masked(c->image_minimap, 21, 9, 146, 151, ve_enabled()?full_offsets:c->minimap_mask_line_offsets, ve_enabled()?full_lengths:c->minimap_mask_line_lengths, anchorX, anchorY, angle, c->minimap_zoom + 256);
     pix24_draw_rotated_masked(c->image_compass, 0, 0, 33, 33, c->compass_mask_line_offsets, c->compass_mask_line_lengths, 25, 25, c->orbit_camera_yaw, 256);
     for (int i = 0; i < c->activeMapFunctionCount; i++) {
         anchorX = c->activeMapFunctionX[i] * 4 + 2 - c->local_player->pathing_entity.x / 32;
@@ -9477,7 +11138,7 @@ void client_draw_on_minimap(Client *c, int dy, Pix24 *image, int dx) {
     int x = (dy * sinAngle + dx * cosAngle) >> 16;
     int y = (dy * cosAngle - dx * sinAngle) >> 16;
 
-    if (distance > 2500) {
+    if (distance > 2500 && !ve_enabled()) {
         pix24_draw_masked(image, x + 94 - image->crop_w / 2, 83 - y - image->crop_h / 2, c->image_mapback);
     } else {
         pix24_draw(image, x + 94 - image->crop_w / 2, 83 - y - image->crop_h / 2);
@@ -9487,20 +11148,20 @@ void client_draw_on_minimap(Client *c, int dy, Pix24 *image, int dx) {
 void client_draw_chatback(Client *c) {
     pixmap_bind(c->area_chatback);
     _Pix3D.line_offset = c->area_chatback_offsets;
-    pix8_draw(c->image_chatback, 0, 0);
+    ui474_parchment_chat(c);
     if (c->show_social_input) {
         char buf[CHAT_LENGTH + 2];
         sprintf(buf, "%s*", c->social_input);
-        drawStringCenter(c->font_bold12, 239, 40, c->social_message, BLACK);
-        drawStringCenter(c->font_bold12, 239, 60, buf, DARKBLUE);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 40, c->social_message, BLACK);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 60, buf, DARKBLUE);
     } else if (c->chatback_input_open) {
         char buf[CHATBACK_LENGTH + 2];
         sprintf(buf, "%s*", c->chatback_input);
-        drawStringCenter(c->font_bold12, 239, 40, "Enter amount:", BLACK);
-        drawStringCenter(c->font_bold12, 239, 60, buf, DARKBLUE);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 40, "Enter amount:", BLACK);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 60, buf, DARKBLUE);
     } else if (c->modal_message[0]) {
-        drawStringCenter(c->font_bold12, 239, 40, c->modal_message, BLACK);
-        drawStringCenter(c->font_bold12, 239, 60, "Click to continue", DARKBLUE);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 40, c->modal_message, BLACK);
+        drawStringCenter(c->font_bold12, (ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH) / 2, 60, c->vita_interface_enabled?"Press X to continue":"Click to continue", DARKBLUE);
     } else if (c->chat_interface_id != -1) {
         client_draw_interface(c, _Component.instances[c->chat_interface_id], 0, 0, 0);
     } else if (c->sticky_chat_interface_id == -1) {
@@ -9509,7 +11170,11 @@ void client_draw_chatback(Client *c) {
             font = c->font_quill8;
         }
         int line = 0;
-        pix2d_set_clipping(77, 463, 0, 0);
+        pix2d_set_clipping(77, lc_chat_text_right(CHAT_TEXT_RIGHT), 0, 0);
+#ifdef VITA_NATIVE_WIDESCREEN
+        if(ve_enabled())ve_draw_chat(c,font);else classic_draw_chat(c,font);
+        line = (c->chat_scroll_height - 7) / 14;
+#else
         for (int i = 0; i < 100; i++) {
             if (c->message_text[i][0]) {
                 int type = c->message_type[i];
@@ -9582,43 +11247,44 @@ void client_draw_chatback(Client *c) {
                 }
             }
         }
+#endif
         pix2d_reset_clipping();
         c->chat_scroll_height = line * 14 + 7;
         if (c->chat_scroll_height < 78) {
             c->chat_scroll_height = 78;
         }
-        client_draw_scrollbar(c, 463, 0, c->chat_scroll_height - c->chat_scroll_offset - 77, c->chat_scroll_height, 77);
+        client_draw_scrollbar(c, lc_chat_text_right(CHAT_TEXT_RIGHT), 0, c->chat_scroll_height - c->chat_scroll_offset - 77, c->chat_scroll_height, 77);
 
         if (_Custom.chat_era == 0) {
             // 186-194?
             char buf2[CHAT_LENGTH + 2];
             sprintf(buf2, "%s*", c->chat_typed);
-            drawString(font, 3, 90, buf2, BLACK);
+            (ve_enabled()?ve_draw_chat_input:classic_draw_chat_input)(font, 3, ve_enabled()?93:90, buf2, BLACK);
         } else if (_Custom.chat_era == 1) {
             // <204
             char buf2[CHAT_LENGTH + 2];
             sprintf(buf2, "%s*", c->chat_typed);
-            drawString(font, 3, 90, buf2, BLUE);
+            (ve_enabled()?ve_draw_chat_input:classic_draw_chat_input)(font, 3, ve_enabled()?93:90, buf2, BLUE);
         } else if (_Custom.chat_era == 2) {
             // 204+
             char buf[USERNAME_LENGTH + 3];
             sprintf(buf, "%s:", jstring_format_name(c->username));
-            drawString(font, 4, 90, buf, BLACK);
+            drawString(font, 4, ve_enabled()?93:90, buf, BLACK);
             sprintf(buf, "%s: ", c->username);
 
             char buf2[CHAT_LENGTH + 2];
             sprintf(buf2, "%s*", c->chat_typed);
-            drawString(font, stringWidth(font, buf) + 6, 90, buf2, BLUE);
+            (ve_enabled()?ve_draw_chat_input:classic_draw_chat_input)(font, stringWidth(font, buf) + 6, ve_enabled()?93:90, buf2, BLUE);
         }
 
-        pix2d_hline(0, 77, BLACK, 479);
+        pix2d_hline(0, ve_enabled()?80:77, BLACK, ve_enabled()?lc_chat_text_right(CHAT_TEXT_RIGHT):CHAT_WIDTH);
     } else {
         client_draw_interface(c, _Component.instances[c->sticky_chat_interface_id], 0, 0, 0);
     }
     if (c->menu_visible && c->menu_area == 2) {
         client_draw_menu(c);
     }
-    pixmap_draw(c->area_chatback, 22, 375);
+    if(!ve_enabled())lc_draw(c->area_chatback,LC_CHAT, (ve_enabled()?ve_chat_text_x():lc_x(LC_CHAT,22)), (ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375))));
     pixmap_bind(c->area_viewport);
     _Pix3D.line_offset = c->area_viewport_offsets;
 }
@@ -9675,7 +11341,7 @@ void client_draw_sidebar(Client *c) {
     if (c->menu_visible && c->menu_area == 1) {
         client_draw_menu(c);
     }
-    pixmap_draw(c->area_sidebar, 562, 231);
+    lc_draw(c->area_sidebar,LC_SIDEBAR, ui474_side_x(), ui474_side_y());
     pixmap_bind(c->area_viewport);
     _Pix3D.line_offset = c->area_viewport_offsets;
 }
@@ -9686,28 +11352,24 @@ void client_update_interface_content(Client *c, Component *component) {
     if (clientCode >= 1 && clientCode <= 100) {
         clientCode--;
         if (clientCode >= c->friend_count) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
             component->buttonType = 0;
         } else {
-            realloc_and_copy(&component->text, c->friendName[clientCode]);
+            strcpy(component->text, c->friendName[clientCode]);
             component->buttonType = 1;
         }
     } else if (clientCode >= 101 && clientCode <= 200) {
         clientCode -= 101;
         if (clientCode >= c->friend_count) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
             component->buttonType = 0;
         } else {
             if (c->friendWorld[clientCode] == 0) {
-                realloc_and_copy(&component->text, "@red@Offline");
+                strcpy(component->text, "@red@Offline");
             } else if (c->friendWorld[clientCode] == _Client.nodeid) {
-                char buf[MAX_STR];
-                sprintf(buf, "@gre@World-%d", c->friendWorld[clientCode] - 9);
-                realloc_and_copy(&component->text, buf);
+                sprintf(component->text, "@gre@World-%d", c->friendWorld[clientCode] - 9);
             } else {
-                char buf[MAX_STR];
-                sprintf(buf, "@yel@World-%d", c->friendWorld[clientCode] - 9);
-                realloc_and_copy(&component->text, buf);
+                sprintf(component->text, "@yel@World-%d", c->friendWorld[clientCode] - 9);
             }
             component->buttonType = 1;
         }
@@ -9719,10 +11381,10 @@ void client_update_interface_content(Client *c, Component *component) {
     } else if (clientCode >= 401 && clientCode <= 500) {
         clientCode -= 401;
         if (clientCode >= c->ignoreCount) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
             component->buttonType = 0;
         } else {
-            realloc_and_copy(&component->text, jstring_format_name(jstring_from_base37(c->ignoreName37[clientCode])));
+            strcpy(component->text, jstring_format_name(jstring_from_base37(c->ignoreName37[clientCode])));
             component->buttonType = 1;
         }
     } else if (clientCode == 503) {
@@ -9732,7 +11394,7 @@ void client_update_interface_content(Client *c, Component *component) {
         }
     } else if (clientCode == 327) {
         component->xan = 150;
-        component->yan = (int)(SIN((DOUBLE)_Client.loop_cycle / 40.0) * 256.0) & 0x7ff;
+        component->yan = (int)(sin((double)_Client.loop_cycle / 40.0) * 256.0) & 0x7ff;
         if (c->update_design_model) {
             c->update_design_model = false;
 
@@ -9781,22 +11443,25 @@ void client_update_interface_content(Client *c, Component *component) {
             component->graphic = c->genderButtonImage1;
         }
     } else if (clientCode == 600) {
-        char buf[MAX_STR];
-        sprintf(buf, "%s%s", c->reportAbuseInput, _Client.loop_cycle % 20 < 10 ? "|" : " ");
-        realloc_and_copy(&component->text, buf);
+        strcpy(component->text, c->reportAbuseInput);
+        if (_Client.loop_cycle % 20 < 10) {
+            strcat(component->text, "|");
+        } else {
+            strcat(component->text, " ");
+        }
     } else if (clientCode == 613) {
         if (!c->rights) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
         } else if (c->reportAbuseMuteOption) {
             component->colour = RED;
-            realloc_and_copy(&component->text, "Moderator option: Mute player for 48 hours: <ON>");
+            strcpy(component->text, "Moderator option: Mute player for 48 hours: <ON>");
         } else {
             component->colour = WHITE;
-            realloc_and_copy(&component->text, "Moderator option: Mute player for 48 hours: <OFF>");
+            strcpy(component->text, "Moderator option: Mute player for 48 hours: <OFF>");
         }
     } else if (clientCode == 650 || clientCode == 655) {
         if (c->lastAddress == 0) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
         } else {
             char text[HALF_STR];
             if (c->daysSinceLastLogin == 0) {
@@ -9806,30 +11471,26 @@ void client_update_interface_content(Client *c, Component *component) {
             } else {
                 sprintf(text, "%d days ago", c->daysSinceLastLogin);
             }
-            char full_text[MAX_STR];
-            sprintf(full_text, "You last logged in %s from: %s", text, _Client.dns);
-            realloc_and_copy(&component->text, full_text);
+            sprintf(component->text, "You last logged in %s from: %s", text, _Client.dns);
         }
     } else if (clientCode == 651) {
         if (c->unreadMessages == 0) {
-            realloc_and_copy(&component->text, "0 unread messages");
+            strcpy(component->text, "0 unread messages");
             component->colour = YELLOW;
         }
         if (c->unreadMessages == 1) {
-            realloc_and_copy(&component->text, "1 unread message");
+            strcpy(component->text, "1 unread message");
             component->colour = GREEN;
         }
         if (c->unreadMessages > 1) {
-            char buf[MAX_STR];
-            sprintf(buf, "%d unread messages", c->unreadMessages);
-            realloc_and_copy(&component->text, buf);
+            sprintf(component->text, "%d unread messages", c->unreadMessages);
             component->colour = GREEN;
         }
     } else if (clientCode == 652) {
         if (c->daysSinceRecoveriesChanged == 201) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
         } else if (c->daysSinceRecoveriesChanged == 200) {
-            realloc_and_copy(&component->text, "You have not yet set any password recovery questions.");
+            strcpy(component->text, "You have not yet set any password recovery questions.");
         } else {
             char text[HALF_STR];
             if (c->daysSinceRecoveriesChanged == 0) {
@@ -9839,25 +11500,23 @@ void client_update_interface_content(Client *c, Component *component) {
             } else {
                 sprintf(text, "%d days ago", c->daysSinceRecoveriesChanged);
             }
-            char full_text[MAX_STR];
-            sprintf(full_text, "%s you changed your recovery questions", text);
-            realloc_and_copy(&component->text, full_text);
+            sprintf(component->text, "%s you changed your recovery questions", text);
         }
     } else if (clientCode == 653) {
         if (c->daysSinceRecoveriesChanged == 201) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
         } else if (c->daysSinceRecoveriesChanged == 200) {
-            realloc_and_copy(&component->text, "We strongly recommend you do so now to secure your account.");
+            strcpy(component->text, "We strongly recommend you do so now to secure your account.");
         } else {
-            realloc_and_copy(&component->text, "If you do not remember making this change then cancel it immediately");
+            strcpy(component->text, "If you do not remember making this change then cancel it immediately");
         }
     } else if (clientCode == 654) {
         if (c->daysSinceRecoveriesChanged == 201) {
-            realloc_and_copy(&component->text, "");
+            strcpy(component->text, "");
         } else if (c->daysSinceRecoveriesChanged == 200) {
-            realloc_and_copy(&component->text, "Do this from the 'account management' area on our front webpage");
+            strcpy(component->text, "Do this from the 'account management' area on our front webpage");
         } else {
-            realloc_and_copy(&component->text, "Do this from the 'account management' area on our front webpage");
+            strcpy(component->text, "Do this from the 'account management' area on our front webpage");
         }
     }
 }
@@ -9877,7 +11536,7 @@ void client_set_highmem(void) {
 }
 
 static const char *formatObjCountTagged(int amount) {
-    static char s[MAX_STR];
+    static char s[SIXTY_STR];
 
     char tmp[14];
     sprintf(tmp, "%d", amount);
@@ -9974,14 +11633,13 @@ static void client_draw_interface(Client *c, Component *com, int x, int y, int s
                         int dy = 0;
                         int id = child->invSlotObjId[slot] - 1;
 
-                        if ((slotX >= -32 && slotX <= 512 && slotY >= -32 && slotY <= 334) || (c->obj_drag_area != 0 && c->objDragSlot == slot)) {
+                        if ((slotX >= -32 && slotX <= _Pix2D.width && slotY >= -32 && slotY <= _Pix2D.height) || (c->obj_drag_area != 0 && c->objDragSlot == slot)) {
                             Pix24 *icon = NULL;
-                            if (_Custom.item_outlines) {
-                                int outline_color = 0;
-                                if (c->obj_selected == 1 && c->objSelectedSlot == slot && c->objSelectedInterface == child->id) {
-                                    outline_color = WHITE;
-                                }
-                                icon = objtype_get_icon_outline(id, child->invSlotObjCount[slot], outline_color);
+                            bool selected_use=c->obj_selected==1&&c->objSelectedSlot==slot&&c->objSelectedInterface==child->id;
+                            /* Item-use feedback is required in both layouts,
+                             * independent of the ordinary outline preference. */
+                            if (_Custom.item_outlines || selected_use) {
+                                icon = objtype_get_icon_outline(id, child->invSlotObjCount[slot], selected_use?WHITE:0);
                             } else {
                                 icon = objtype_get_icon(id, child->invSlotObjCount[slot]);
                             }
@@ -10015,11 +11673,7 @@ static void client_draw_interface(Client *c, Component *com, int x, int y, int s
                                 drawString(c->font_plain11, slotX + dx, slotY + 9 + dy, formatObjCount(count), YELLOW);
                             }
 
-                            if (_Custom.item_outlines) {
-                                if (c->obj_selected == 1 && c->objSelectedSlot == slot && c->objSelectedInterface == child->id) {
-                                    pix24_free(icon);
-                                }
-                            }
+                            if (selected_use) pix24_free(icon);
                         }
                     } else if (child->invSlotSprite && slot < 20) {
                         Pix24 *image = child->invSlotSprite[slot];
@@ -10044,7 +11698,8 @@ static void client_draw_interface(Client *c, Component *com, int x, int y, int s
             char text[DOUBLE_STR];
             strcpy(text, child->text);
 
-            if ((c->chatHoveredInterfaceIndex == child->id || c->sidebarHoveredInterfaceIndex == child->id || c->viewportHoveredInterfaceIndex == child->id) && child->overColour != 0) {
+            int dialogueHover=vita_dialogue_hover(c,child->id);
+            if ((dialogueHover==1 || (dialogueHover<0 && (c->chatHoveredInterfaceIndex == child->id || c->sidebarHoveredInterfaceIndex == child->id || c->viewportHoveredInterfaceIndex == child->id))) && child->overColour != 0) {
                 color = child->overColour;
             }
 
@@ -10060,6 +11715,10 @@ static void client_draw_interface(Client *c, Component *com, int x, int y, int s
                 strcpy(text, "Please wait...");
                 color = child->colour;
             }
+
+            const char *prompt=vita_dialogue_prompt(c,child->id,text);
+            if(prompt!=text)strcpy(text,prompt);
+            color=vita_interface_text_colour(c,child->id,color);
 
             for (int lineY = childY + font->height; strlen(text) > 0; lineY += font->height) {
                 if (indexof_chr(text, '%') != -1) {
@@ -10243,8 +11902,17 @@ static void client_draw_interface(Client *c, Component *com, int x, int y, int s
 }
 
 void client_draw_menu(Client *c) {
+    if(ve_menu_separate(c))return;
     int x = c->menu_x;
     int y = c->menu_y;
+    int mouseX=c->shell->mouse_x,mouseY=c->shell->mouse_y;
+    if(c->menu_area==0){mouseX-=ve_enabled()?0:8;mouseY-=ve_enabled()?0:11;}
+    if(c->menu_area==1){mouseX-=ui474_side_x();mouseY-=ui474_side_y();}
+    if(c->menu_area==2){mouseX-=22;mouseY-=(ve_enabled()?ve_chat_text_y():lc_y(LC_CHAT,UI_BOTTOM(375)));}
+    client_raster_menu(c,x,y,mouseX,mouseY);
+}
+
+static void client_raster_menu(Client*c,int x,int y,int mouseX,int mouseY){
     int w = c->menu_width;
     int h = c->menu_height;
     int background = OPTIONS_MENU;
@@ -10253,20 +11921,6 @@ void client_draw_menu(Client *c) {
     pix2d_draw_rect(x + 1, y + 18, BLACK, w - 2, h - 19);
 
     drawString(c->font_bold12, x + 3, y + 14, "Choose Option", background);
-    int mouseX = c->shell->mouse_x;
-    int mouseY = c->shell->mouse_y;
-    if (c->menu_area == 0) {
-        mouseX -= 8;
-        mouseY -= 11;
-    }
-    if (c->menu_area == 1) {
-        mouseX -= 562;
-        mouseY -= 231;
-    }
-    if (c->menu_area == 2) {
-        mouseX -= 22;
-        mouseY -= 375;
-    }
 
     for (int i = 0; i < c->menu_size; i++) {
         int optionY = y + (c->menu_size - 1 - i) * 15 + 31;
@@ -10274,13 +11928,21 @@ void client_draw_menu(Client *c) {
         if (mouseX > x && mouseX < x + w && mouseY > optionY - 13 && mouseY < optionY + 3) {
             rgb = YELLOW;
         }
+#ifdef __vita__
+        if (c->vita_menu_active) {
+            rgb = i == c->vita_menu_selected ? YELLOW : WHITE;
+            if (i == c->vita_menu_selected) {
+                pix2d_fill_rect(x + 2, optionY - 12, 0x302B23, w - 4, 15);
+            }
+        }
+#endif
         drawStringTaggable(c->font_bold12, x + 3, optionY, c->menu_option[i], rgb, true);
     }
 }
 
 void client_draw_error(Client *c) {
     platform_set_color(BLACK);
-    platform_fill_rect(0, 0, 789, 532);
+    platform_fill_rect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
     gameshell_set_framerate(c->shell, 1);
 
     if (c->error_loading) {
@@ -10344,9 +12006,25 @@ void client_draw_error(Client *c) {
     }
 }
 
+static void client_draw_title_panel(Client*c,bool loading){
+ if(!c->title_restored){pixmap_draw(c->image_title4,TITLE_X(214),TITLE_Y(186));return;}
+ memcpy(c->title_panel_scaled->pixels,c->title_panel_background->pixels,360*200*sizeof(int));
+ int width=loading?325:342,height=loading?181:190;
+ int ox=loading?19:10,oy=loading?10:5;
+ for(int dy=0;dy<height;dy++)for(int dx=0;dx<width;dx++){
+  int sx=title_panel_x[loading?title_loading_x[dx]:dx],sy=title_panel_y[loading?title_loading_y[dy]:dy],color=c->image_title4->pixels[sy*360+sx];
+  int bx=sx-c->image_titlebox->crop_x,by=sy-c->image_titlebox->crop_y;
+  bool opaque=bx>=0&&bx<c->image_titlebox->width&&by>=0&&by<c->image_titlebox->height&&c->image_titlebox->pixels[by*c->image_titlebox->width+bx]!=0;
+  if(color||opaque)c->title_panel_scaled->pixels[(dy+oy)*360+dx+ox]=color;
+ }
+ pixmap_draw(c->title_panel_scaled,TITLE_X(214),TITLE_Y(186));
+}
+
 void client_draw_title_screen(Client *c) {
     client_load_title(c);
+    if(c->title_restored){vita_title_draw_panel(c,false,NULL,0);goto title_background;}
     pixmap_bind(c->image_title4);
+        if(c->title_restored){memset(c->image_title4->pixels,0,360*200*sizeof(int));pix8_draw(c->image_titlebox,0,0);}
     pix8_draw(c->image_titlebox, 0, 0);
 
     int w = 360;
@@ -10391,7 +12069,7 @@ void client_draw_title_screen(Client *c) {
         int x = w / 2 - 80;
         y = h / 2 + 50;
         pix8_draw(c->image_titlebutton, x - 73, y - 20);
-        drawStringTaggableCenter(c->font_bold12, "Login", x, y + 5, WHITE, true);
+        drawStringTaggableCenter(c->font_bold12,title_new_player?"Create Player":"Login",x,y+5,WHITE,true);
 
         x = w / 2 + 80;
         pix8_draw(c->image_titlebutton, x - 73, y - 20);
@@ -10418,29 +12096,37 @@ void client_draw_title_screen(Client *c) {
         drawStringTaggableCenter(c->font_bold12, "Cancel", x, y + 5, WHITE, true);
     }
 
-    pixmap_draw(c->image_title4, 214, 186);
+    client_draw_title_panel(c,false);
+title_background:
 #ifdef GL11
     c->redraw_background = true;
 
-    c->image_title0->dirty = true;
-    c->image_title1->dirty = true;
-    pixmap_draw(c->image_title0, 0, 0);
-    pixmap_draw(c->image_title1, 661, 0);
+    /* Restored-title flame animation uses its own clipped textures. These
+     * two images are immutable background artwork in that mode. */
+    if(!c->title_restored){c->image_title0->dirty=true;c->image_title1->dirty=true;}
+    pixmap_draw(c->image_title0, TITLE_FLAME_LEFT_X, TITLE_Y(0));
+    pixmap_draw(c->image_title1, TITLE_FLAME_RIGHT_X, TITLE_Y(0));
 #endif
     if (c->redraw_background) {
         c->redraw_background = false;
-        pixmap_draw(c->image_title2, 128, 0);
-        pixmap_draw(c->image_title3, 214, 386);
-        pixmap_draw(c->image_title5, 0, 265);
-        pixmap_draw(c->image_title6, 574, 265);
-        pixmap_draw(c->image_title7, 128, 186);
-        pixmap_draw(c->image_title8, 574, 186);
+        pixmap_draw(c->image_title0, TITLE_FLAME_LEFT_X, TITLE_Y(0));
+        pixmap_draw(c->image_title1, TITLE_FLAME_RIGHT_X, TITLE_Y(0));
+        pixmap_draw(c->image_title2, TITLE_TOP_X, TITLE_TOP_Y);
+        pixmap_draw(c->image_title3, TITLE_BOTTOM_X, TITLE_BOTTOM_Y);
+        pixmap_draw(c->image_title5, TITLE_LEFT_BASE_X, TITLE_Y(265));
+        pixmap_draw(c->image_title6, TITLE_X(574), TITLE_Y(265));
+        pixmap_draw(c->image_title7, TITLE_LEFT_MID_X, TITLE_Y(186));
+        pixmap_draw(c->image_title8, TITLE_X(574), TITLE_Y(186));
     }
 
     client_run_flames(c); // NOTE: random placement of run_flames
+    title_theme_draw(c);
+    ve_ui_probe(c);
 }
 
 void client_unload(Client *c) {
+    r109_clear();
+    vita_title_invalidate();
     bump_allocator_free();
 
     model_free_global();
@@ -10486,8 +12172,11 @@ static bool secured = false;
 #endif
 
 int main(int argc, char **argv) {
+#ifdef BUILD_A_EMBEDDED
+    extern void ba_vita_init(void);
+    ba_vita_init();
+#endif
     // init screen before logging is required for some platforms
-    // NOTE: this means you can't depend on config settings being loaded
     if (!platform_init()) {
         rs2_error("Failed to init platform!\n");
         rs2_sleep(5000);
@@ -10587,6 +12276,7 @@ void client_free(Client *c) {
     pixfont_free(c->font_quill8);
     jagfile_free(c->archive_title);
 
+    ve_release(c);
     if (c->area_chatback) {
         // other images are allocated at same time
         pixmap_free(c->area_chatback);
@@ -10618,6 +12308,7 @@ void client_free(Client *c) {
         pix24_free(c->image_flames_left);
         pix24_free(c->image_flames_right);
 #endif
+        if(c->title_restored){pixmap_free(c->title_panel_scaled);pix24_free(c->title_panel_background);c->title_panel_scaled=NULL;c->title_panel_background=NULL;pixmap_free(c->title_flame_left);pixmap_free(c->title_flame_right);pixmap_free(c->title_flame_clip_left);pixmap_free(c->title_flame_clip_right);c->title_restored=false;}
         pixmap_free(c->image_title0);
         pixmap_free(c->image_title1);
         pixmap_free(c->image_title2);
@@ -10641,13 +12332,13 @@ void client_free(Client *c) {
     }
     free(c->image_sideicons);
     pix24_free(c->image_compass);
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 65; i++) {
         if (c->image_mapscene[i]) {
             pix8_free(c->image_mapscene[i]);
         }
     }
     free(c->image_mapscene);
-    for (int i = 0; i < 50; i++) {
+    for (int i = 0; i < 65; i++) {
         if (c->image_mapfunction[i]) {
             pix24_free(c->image_mapfunction[i]);
         }
@@ -10731,6 +12422,7 @@ void client_free(Client *c) {
         free(c->level_obj_stacks[level]);
     }
     free(c->level_obj_stacks);
+    linklist_clear(c->locList);
     linklist_free(c->locList);
     free(c->levelTileFlags);
     free(c->levelHeightmap);
@@ -10752,8 +12444,8 @@ Client *client_new(void) {
 
     c->shell = gameshell_new();
     c->image_sideicons = calloc(13, sizeof(Pix8 *));
-    c->image_mapscene = calloc(50, sizeof(Pix8 *));
-    c->image_mapfunction = calloc(50, sizeof(Pix24 *));
+    c->image_mapscene = calloc(65, sizeof(Pix8 *));
+    c->image_mapfunction = calloc(65, sizeof(Pix24 *));
     c->image_hitmarks = calloc(20, sizeof(Pix24 *));
     c->image_headicons = calloc(20, sizeof(Pix24 *));
     c->image_crosses = calloc(8, sizeof(Pix24 *));
@@ -10898,10 +12590,10 @@ Jagfile *load_archive(Client *c, const char *name, int crc, const char *display_
     int8_t *data;
     int8_t *header = malloc(6);
     char filename[PATH_MAX];
-#if defined(NXDK)
+#ifdef _arch_dreamcast
+    snprintf(filename, sizeof(filename), "cache/client/%s.", name);
+#elif defined(NXDK)
     snprintf(filename, sizeof(filename), "D:\\cache\\client\\%s", name);
-#elif defined(__NDS__)
-    snprintf(filename, sizeof(filename), "cache/client/%s", name);
 #else
     snprintf(filename, sizeof(filename), "rom/cache/client/%s", name);
 #endif
@@ -10915,7 +12607,7 @@ Jagfile *load_archive(Client *c, const char *name, int crc, const char *display_
     FILE *file = fopen(filename, "rb");
 #endif
     if (!file) {
-        rs2_error("Failed to open file %s (%s)\n", filename, strerror(errno));
+        rs2_error("Failed to open file\n", strerror(errno));
         free(header);
         return NULL;
     }
@@ -10939,7 +12631,7 @@ Jagfile *load_archive(Client *c, const char *name, int crc, const char *display_
 #else
     if (fread(data + total_read, 1, remaining, file) != remaining) {
 #endif
-        rs2_error("Failed to read file %s. %s\n", filename, strerror(errno));
+        rs2_error("Failed to read file\n", strerror(errno));
     }
 #ifdef ANDROID
     SDL_RWclose(file);
@@ -10950,7 +12642,7 @@ Jagfile *load_archive(Client *c, const char *name, int crc, const char *display_
 
     int crc_value = rs_crc32(data, file_size);
     if (crc_value != crc) {
-        rs2_error("%s archive CRC check failed, update archive_checksum to match server cache\n", display_name);
+        rs2_log("%s archive CRC check failed (update archive_checksums if login says RuneScape has been updated) TODO downloading\n", display_name);
         // free(data);
         // data = NULL;
     }
@@ -10968,6 +12660,7 @@ void client_load_title(Client *c) {
         pixmap_free(c->shell->draw_area);
         c->shell->draw_area = NULL;
     }
+    ve_release(c);
     if (c->area_chatback) {
         // other images are allocated at same time
         pixmap_free(c->area_chatback);
@@ -10992,25 +12685,25 @@ void client_load_title(Client *c) {
     c->image_title1 = pixmap_new(128, 265);
     pix2d_clear();
 
-    c->image_title2 = pixmap_new(533, 186);
+    c->image_title2 = pixmap_new(TITLE_TOP_WIDTH, TITLE_TOP_HEIGHT);
     pix2d_clear();
 
-    c->image_title3 = pixmap_new(360, 146);
+    c->image_title3 = pixmap_new(TITLE_BOTTOM_WIDTH, TITLE_BOTTOM_HEIGHT);
     pix2d_clear();
 
     c->image_title4 = pixmap_new(360, 200);
     pix2d_clear();
 
-    c->image_title5 = pixmap_new(214, 267);
+    c->image_title5 = pixmap_new(TITLE_LEFT_BASE_WIDTH, 267);
     pix2d_clear();
 
-    c->image_title6 = pixmap_new(215, 267);
+    c->image_title6 = pixmap_new(TITLE_RIGHT_BASE_WIDTH, 267);
     pix2d_clear();
 
-    c->image_title7 = pixmap_new(86, 79);
+    c->image_title7 = pixmap_new(TITLE_LEFT_MID_WIDTH, 79);
     pix2d_clear();
 
-    c->image_title8 = pixmap_new(87, 79);
+    c->image_title8 = pixmap_new(TITLE_RIGHT_MID_WIDTH, 79);
     pix2d_clear();
 
     if (c->archive_title) {
@@ -11022,14 +12715,14 @@ void client_load_title(Client *c) {
 }
 
 void client_draw_progress(Client *c, const char *message, int progress) {
-#ifdef __NDS__
-    rs2_log("%s %d%%\n", message, progress);
-#endif
+    if(progress<0)progress=0;else if(progress>100)progress=100;
     client_load_title(c);
     if (!c->archive_title) {
         gameshell_draw_progress(c->shell, message, progress);
     } else {
-        pixmap_bind(c->image_title4);
+        if(c->title_restored){vita_title_draw_panel(c,true,message,progress);goto progress_background;}
+            pixmap_bind(c->image_title4);
+        if(c->title_restored){memset(c->image_title4->pixels,0,360*200*sizeof(int));pix8_draw(c->image_titlebox,0,0);}
         int x = 360;
         int y = 200;
         int offsetY = 20;
@@ -11040,29 +12733,32 @@ void client_draw_progress(Client *c, const char *message, int progress) {
         pix2d_fill_rect(x / 2 - 150, midY + 2, PROGRESS_RED, progress * 3, 30);
         pix2d_fill_rect(x / 2 - 150 + progress * 3, midY + 2, BLACK, 300 - progress * 3, 30);
         drawStringCenter(c->font_bold12, x / 2, y / 2 + 5 - offsetY, message, WHITE);
-        pixmap_draw(c->image_title4, 214, 186);
+        client_draw_title_panel(c,true);
+progress_background:
 #ifdef GL11
         c->redraw_background = true;
         if (c->flame_active) {
-            pixmap_draw(c->image_title0, 0, 0);
-            pixmap_draw(c->image_title1, 661, 0);
+            pixmap_draw(c->image_title0, TITLE_FLAME_LEFT_X, TITLE_Y(0));
+            pixmap_draw(c->image_title1, TITLE_FLAME_RIGHT_X, TITLE_Y(0));
         }
 #endif
         if (c->redraw_background) {
             c->redraw_background = false;
             if (!c->flame_active) {
-                pixmap_draw(c->image_title0, 0, 0);
-                pixmap_draw(c->image_title1, 661, 0);
+                pixmap_draw(c->image_title0, TITLE_FLAME_LEFT_X, TITLE_Y(0));
+                pixmap_draw(c->image_title1, TITLE_FLAME_RIGHT_X, TITLE_Y(0));
             }
-            pixmap_draw(c->image_title2, 128, 0);
-            pixmap_draw(c->image_title3, 214, 386);
-            pixmap_draw(c->image_title5, 0, 265);
-            pixmap_draw(c->image_title6, 574, 265);
-            pixmap_draw(c->image_title7, 128, 186);
-            pixmap_draw(c->image_title8, 574, 186);
+            pixmap_draw(c->image_title2, TITLE_TOP_X, TITLE_TOP_Y);
+            pixmap_draw(c->image_title3, TITLE_BOTTOM_X, TITLE_BOTTOM_Y);
+            pixmap_draw(c->image_title5, TITLE_LEFT_BASE_X, TITLE_Y(265));
+            pixmap_draw(c->image_title6, TITLE_X(574), TITLE_Y(265));
+            pixmap_draw(c->image_title7, TITLE_LEFT_MID_X, TITLE_Y(186));
+            pixmap_draw(c->image_title8, TITLE_X(574), TITLE_Y(186));
         }
 
         platform_update_surface();
     }
 }
+
+void client_ui474_draw_interface(Client*c,Component*r,int x,int y,int scroll){client_draw_interface(c,r,x,y,scroll);}
 #endif

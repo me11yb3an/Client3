@@ -36,4 +36,5 @@ struct rsa {
 
 int rsa_init(struct rsa *rsa, const char *exponent, const char *modulus);
 int rsa_crypt(struct rsa *rsa, void *buffer, size_t len, void *out, size_t outlen);
+void rsa_free(struct rsa *rsa);
 #endif

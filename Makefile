@@ -51,6 +51,9 @@ endif
 endif
 endif
 
+include build244.mk
+SRC := $(filter-out $(BUILD244_UNITS),$(SRC))
+
 ifeq ($(GL),1)
 CFLAGS += -DGL11
 ifeq ($(shell uname -s),Darwin)

@@ -1,10 +1,13 @@
 #include <stdlib.h>
+#include <string.h>
+#include "../platform.h"
 
 #include "../packet.h"
 #include "wave.h"
 #include <stdbool.h>
 
 WaveData _Wave = {0};
+static Packet *original_effect_pcm[1000] = {0};
 extern ToneData _Tone;
 
 static int generate(Wave *wave, int loopCount);
@@ -12,6 +15,7 @@ static void wave_free(Wave *wave);
 
 void wave_free_global(void) {
     for (int i = 0; i < 1000; i++) {
+        if (original_effect_pcm[i]) { packet_free(original_effect_pcm[i]); original_effect_pcm[i] = NULL; }
         if (_Wave.tracks[i]) {
             wave_free(_Wave.tracks[i]);
         }
@@ -47,7 +51,13 @@ void wave_unpack(Packet *dat) {
     }
 }
 
+int wave_available(int id) {
+    return id >= 0 && id < 1000 && (original_effect_pcm[id] || _Wave.tracks[id]);
+}
+
 Packet *wave_generate(int id, int loopCount) {
+    if (!wave_available(id)) return NULL;
+    if (original_effect_pcm[id]) return original_effect_pcm[id];
     if (!_Wave.tracks[id]) {
         return NULL;
     }
@@ -100,6 +110,7 @@ int wave_trim(Wave *wave) {
 }
 
 Packet *wave_get_wave(Wave *wave, int loopCount) {
+    if (!wave || !_Wave.waveBuffer || !_Wave.waveBytes) return NULL;
     int length = generate(wave, loopCount);
     _Wave.waveBuffer->pos = 0;
     p4(_Wave.waveBuffer, 0x52494646);   // "RIFF" ChunkID
@@ -178,4 +189,24 @@ static int generate(Wave *wave, int loopCount) {
     }
 
     return totalSampleCount;
+}
+
+// The three imported effects are verified one-shots (original loopBegin == loopEnd == 0).
+// Original JagFX/Tone/Filter code renders their immutable PCM; no filter is discarded.
+void wave_unpack_pcm(Packet *dat) {
+    if (dat->length < 6 || g4(dat) != 0x4e535031) rs2_error("Invalid original-effect PCM header");
+    int count = g2(dat);
+    if (count > 1000) rs2_error("Invalid original-effect PCM count");
+    for (int i = 0; i < count; i++) {
+        if (dat->pos + 8 > dat->length) rs2_error("Truncated original-effect PCM record");
+        int id = g2(dat), delay = g2(dat), size = g4(dat);
+        if (id < 0 || id >= 1000 || size < 44 || size > 441000 || size > dat->length - dat->pos || _Wave.tracks[id] || original_effect_pcm[id]) rs2_error("Invalid or colliding original-effect PCM record");
+        int8_t *bytes = malloc(size);
+        if (!bytes) rs2_error("Original-effect PCM allocation failed");
+        memcpy(bytes, dat->data + dat->pos, size); dat->pos += size;
+        if (memcmp(bytes, "RIFF", 4) || memcmp(bytes + 8, "WAVE", 4)) rs2_error("Invalid original-effect WAV");
+        original_effect_pcm[id] = packet_new(bytes, size); original_effect_pcm[id]->pos = size;
+        _Wave.delays[id] = delay;
+    }
+    if (dat->pos != dat->length) rs2_error("Trailing original-effect PCM data");
 }

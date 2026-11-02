@@ -260,14 +260,6 @@ void client_unload(Client *c) {
 
 int main(int argc, char **argv) {
     (void)argc, (void)argv;
-
-    // init screen before logging is required for some platforms
-    if (!platform_init()) {
-        rs2_error("Failed to init platform!\n");
-        rs2_sleep(5000);
-        return 1;
-    }
-
     srand(0);
     Client *c = client_new();
     model_init_global();
@@ -300,22 +292,18 @@ Jagfile *load_archive_simple(const char *name, int crc, const char *display_name
     int8_t *data = NULL;
     int8_t *header = malloc(6);
     char filename[PATH_MAX];
-#if defined(__NDS__)
-    snprintf(filename, sizeof(filename), "cache/client/%s", name);
-#else
     snprintf(filename, sizeof(filename), "rom/cache/client/%s", name);
-#endif
     rs2_log("Loading %s\n", filename);
 
     FILE *file = fopen(filename, "rb");
     if (!file) {
-        rs2_error("Failed to open file %s (%s)\n", filename, strerror(errno));
+        rs2_error("Failed to open file\n", strerror(errno));
         free(header);
         return NULL;
     }
 
     if (fread(header, 1, 6, file) != 6) {
-        rs2_error("Failed to read header %s\n", strerror(errno));
+        rs2_error("Failed to read header\n", strerror(errno));
     }
     Packet *packet = packet_new(header, 6);
     packet->pos = 3;
@@ -326,7 +314,7 @@ Jagfile *load_archive_simple(const char *name, int crc, const char *display_name
 
     size_t remaining = file_size - total_read;
     if (fread(data + total_read, 1, remaining, file) != remaining) {
-        rs2_error("Failed to read file %s. %s\n", filename, strerror(errno));
+        rs2_error("Failed to read file\n", strerror(errno));
     }
     fclose(file);
     packet_free(packet);

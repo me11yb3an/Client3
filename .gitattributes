@@ -1,2 +1,4 @@
 *.bat text eol=crlf
 *.ini text eol=auto
+server/*.js linguist-vendored
+src/thirdparty/** linguist-vendored
