@@ -1,8 +1,8 @@
 # RuneScape 2 for PlayStation Vita
 
-This repository is a GitHub fork of [lesleyrs/Client3](https://github.com/lesleyrs/Client3), the C port of the RuneScape 2 client. `main` is that upstream history and has not been changed. The local branch `migration/vita-build-244` adds the build 244 Vita work on top of Client3 commit `53c4cf8dbc20cedf588ee07684709f3cd3aee2b7`.
+RuneScape Vita is a PlayStation Vita port of the revision 225 RuneScape 2 client, with an in-process offline world and on-console saves. This repository is a GitHub fork of [lesleyrs/Client3](https://github.com/lesleyrs/Client3). The Vita work published here is build 244 of revision 225, based on Client3 commit `53c4cf8dbc20cedf588ee07684709f3cd3aee2b7`.
 
-Build 244 is revision 225, the 18 May 2004 client. Revision 377 is a separate project and is not in this tree. This repository is not affiliated with Jagex.
+This is source code. It is not a downloadable game package, and it is not affiliated with Jagex. Revision 377 is a separate project and is not in this tree.
 
 The earlier export remains at [me11yb3an/rs2vita377clientsourcecode](https://github.com/me11yb3an/rs2vita377clientsourcecode). That repository was not renamed, overwritten, or deleted.
 
@@ -39,9 +39,11 @@ One Vita process runs the C client and a QuickJS runtime. `src/platform/vita.c` 
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the longer description. The framebuffer is 960×544. The user heap budget in `src/offline_vita.c` is 224 MiB, separate from the CDRAM framebuffers.
 
-## VitaSDK build
+## Build requirements
 
-This branch was prepared on a machine without VitaSDK, so nothing was compiled. The check that was run is the input list: `units.mk` names 162 in-repo sources, and the only missing ones are generated image headers that were left out on purpose.
+A fresh VitaSDK compilation of this tree has not succeeded. `make -f units.mk -n` parses the makefile and stops because `src/r63_search_icon.h` is missing. Do not treat a checkout as a finished, reproducible build.
+
+The build 244 commands, once the missing inputs below are supplied locally, are:
 
 ```sh
 make -f units.mk
@@ -49,16 +51,25 @@ make -f units.mk client.elf
 make -f units.mk eboot.bin
 ```
 
-Requirements:
+Dependencies that are not in this repository:
 
-- VitaSDK on `PATH`: `arm-vita-eabi-gcc`, `arm-vita-eabi-strip`, `vita-elf-create`, `vita-make-fself`
-- vitaGL and vitaShaCC. A console GL build also needs `libshacccg.suprx` installed on the Vita. That file is not in this repository
-- External link inputs that are not in the tree: `libquickjs.a`, `libvita225_native_bridge.a`, `libbz2.a`, `vita_crypto.o`, `vita-segment-gap.ld`, and `vendor/quickjs-vita/quickjs.h`
-- The five generated image headers named in [docs/BUILDING.md](docs/BUILDING.md)
+- VitaSDK: `arm-vita-eabi-gcc`, `arm-vita-eabi-strip`, `vita-elf-create`, `vita-make-fself`. `units.mk` still calls `/usr/local/vitasdk/bin/arm-vita-eabi-gcc`.
+- vitaGL and vitaShaCC. A console GL build also needs `libshacccg.suprx` installed on the Vita. That file is not in git.
+- `libquickjs.a`, `vendor/quickjs-vita/quickjs.h`, `libvita225_native_bridge.a`, `libbz2.a`, `vita_crypto.o`, and `vita-segment-gap.ld`.
+- Five generated image headers listed in [docs/BUILD-DEPS.md](docs/BUILD-DEPS.md). They were left out because they embed artwork.
+- A local resource pack. `src/offline_vita.c` stops unless `ba_resource_init()` succeeds. `src/vita_enhanced.c` also opens `rom/vita-enhanced.bin`.
 
-`units.mk` and `link.sh` in the root have had their in-repo paths pointed at this checkout. The unmodified checkpoint scripts are `provenance/checkpoint-units.mk` and `provenance/checkpoint-link.sh`. Includes under `/tmp/rs225-codex-r15` and `/tmp/rs225-codex-bridge` are still external.
+`provenance/checkpoint-units.mk` and `provenance/checkpoint-link.sh` are the unmodified checkpoint scripts. `make -f vita.mk` is the upstream Client3 package rule. It still names `rom/cache` and `rom/SCC1_Florestan.sf2`, which this tree does not contain, and it does not link the QuickJS world. Use `units.mk` for the build 244 source build. Do not commit the package it would produce.
 
-`make -f vita.mk` is the upstream Client3 package rule. It packs `rom/`, which this fork inherited from Client3, and it does not link the QuickJS world.
+## Installation prerequisites
+
+This repository does not contain a VPK. Installing a test build on a Vita is a separate step you do yourself.
+
+- A Vita prepared for homebrew, with VitaSDK only required if you are compiling.
+- `libshacccg.suprx` on the console for the vitaGL path.
+- Your own copy of the runtime resource pack and `rom/vita-enhanced.bin`.
+- The Roboto fonts in `rom/Roboto/` are included. Their notice is `rom/Roboto/NOTICE`.
+- `rom/config.ini` has an empty password. Put a password only in a local file that you do not commit.
 
 ## Controller
 
@@ -97,7 +108,15 @@ Both bundles are a revision 225 world. `src/util/Environment.ts` inside them mat
 
 ## Current status
 
-Build 244 is the Vita snapshot on this branch. It has not been rebuilt here. [docs/STATUS.md](docs/STATUS.md) lists what the source contains and what a clone cannot do by itself.
+Build 244 / revision 225 is the working Vita foundation in this repository. It has not passed a fresh VitaSDK link. [docs/STATUS.md](docs/STATUS.md) and [docs/BUILD-DEPS.md](docs/BUILD-DEPS.md) list the missing inputs.
+
+## Known limitations
+
+- The five image headers, the native bridge, `vita_crypto.o`, the segment linker script, and QuickJS are not in the tree.
+- Circle and Start are read and then ignored.
+- `make -f vita.mk` still expects cache and soundfont paths that were removed from this branch.
+- There is no repository-wide license. Client3 publishes none, and a GitHub fork does not grant one. The files that still need a grant are listed in [docs/CLIENT3-REDISTRIBUTION.md](docs/CLIENT3-REDISTRIBUTION.md). The practical channel is the author of [lesleyrs/Client3](https://github.com/lesleyrs/Client3).
+- Older commits on this fork, and upstream Client3, still contain `rom/cache` and `rom/SCC1_Florestan.sf2`. This branch does not. History was not rewritten, so those blobs remain reachable from the parent history.
 
 ## Revision 377
 
@@ -116,9 +135,9 @@ The two tracks stay separate:
 | Working Vita client | Revision 225, build 244 | This branch, `migration/vita-build-244` |
 | Experimental client | Revision 377 | Outside this fork. Not a build flag and not part of the publication decision for build 244 |
 
-## Before publication
+## Compliance
 
-The pre-publication review is [docs/PUBLICATION.md](docs/PUBLICATION.md). The Client3 files that still need a redistribution grant are listed in [docs/CLIENT3-REDISTRIBUTION.md](docs/CLIENT3-REDISTRIBUTION.md). The Vita build inputs are listed in [docs/BUILD-DEPS.md](docs/BUILD-DEPS.md). This branch has not been pushed. Public `main` is still unmodified Client3, so it still contains `rom/cache` and `rom/SCC1_Florestan.sf2`. This branch does not.
+The review notes are [docs/PUBLICATION.md](docs/PUBLICATION.md), [docs/COMPLIANCE.md](docs/COMPLIANCE.md), and [docs/PROVENANCE.md](docs/PROVENANCE.md). Publishing this branch does not close the Client3 permission question.
 
 ## Credits
 
@@ -133,12 +152,8 @@ RuneScape is a trademark of Jagex.
 
 ## License and compliance
 
-There is no root `LICENSE`. Forking a public repository on GitHub does not grant a license to modify or redistribute an unlicensed project. Client3 publishes no license, and no written grant is in this tree. The modified Client3 files need that permission before this branch is published.
+There is no root `LICENSE`. Forking a public repository on GitHub does not grant a license to modify or redistribute Client3. Client3 publishes no license, and no written grant is in this tree. [docs/LICENSING.md](docs/LICENSING.md) is the longer audit.
 
-[docs/COMPLIANCE.md](docs/COMPLIANCE.md) separates confirmed items from open questions. [docs/PROVENANCE.md](docs/PROVENANCE.md) records the export and the engine pin. [docs/LICENSING.md](docs/LICENSING.md) is the longer audit.
+## What this tree does not contain
 
-## What was not added
-
-`RS2_Ver_0.92.vpk` was reviewed and left out. It contains `resources/client.pak`, `resources/server.pak`, `sp/offline_test.sav`, `module/libshacccg.suprx`, and a compiled `eboot.bin`.
-
-This fork already contains Client3's `rom/` tree, including `rom/cache`, 230 MIDI files, `rom/SCC1_Florestan.sf2`, and Roboto fonts, because GitHub copies the upstream repository when it creates a fork. Those files were not added by the Vita migration, and this branch does not delete them. Deleting them from the published fork would be a separate decision. History has not been rewritten.
+No VPK, `eboot.bin`, `client.pak`, `server.pak`, player save, or `libshacccg.suprx` is tracked. `rom/cache/` and `rom/SCC1_Florestan.sf2` are not in this branch. The Roboto fonts remain, with `rom/Roboto/NOTICE`. A draft description for a future VPK release that you upload yourself is [docs/VPK-RELEASE-DRAFT.md](docs/VPK-RELEASE-DRAFT.md). That file is not a published GitHub Release.
