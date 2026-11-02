@@ -109,6 +109,17 @@ Revision 377 stays outside this fork until it is reviewed on its own. The roadma
 
 No 377 client source was added to this branch.
 
+The two tracks stay separate:
+
+| Track | Revision | Where it is |
+| --- | --- | --- |
+| Working Vita client | Revision 225, build 244 | This branch, `migration/vita-build-244` |
+| Experimental client | Revision 377 | Outside this fork. Not a build flag and not part of the publication decision for build 244 |
+
+## Before publication
+
+The pre-publication review is [docs/PUBLICATION.md](docs/PUBLICATION.md). This branch has not been pushed. The published fork on `main` is still unmodified Client3, including the inherited `rom/` tree.
+
 ## Credits
 
 - **[lesleyrs/Client3](https://github.com/lesleyrs/Client3)** — the C client this fork is based on. [RustCityRS/client-c](https://github.com/RustCityRS/client-c) is a fork of that project. Neither publishes a license. The upstream readme is [docs/CLIENT3-README.md](docs/CLIENT3-README.md).

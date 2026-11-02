@@ -39,7 +39,7 @@ These paths are still outside the clone:
 - `/tmp/rs225-codex-r15/` for QuickJS, the native bridge, bzip2, `vita_crypto.o`, a bridge header, and `vita-segment-gap.ld`
 - `/tmp/rs225-codex-bridge/` as an include directory
 
-The branch was prepared on a machine with no `arm-vita-eabi-gcc` and no `VITASDK`, so the scripts were not executed. A path check of `units.mk` found 162 in-repo inputs. Three of those are generated headers and are absent on purpose: `src/vita_map_aperture.generated.h`, `src/r27_cursor_images.h`, and `src/r63_search_icon.h`. `src/ui474.c` also includes `src/runner_icon.generated.h` and `src/custom_run_stone.generated.h`, which the makefile does not list as its own prerequisites. All five stay out because they embed artwork.
+On 2 November 2026, `make -f units.mk -n` parsed the makefile and printed compile lines, then stopped with exit code 2: `No rule to make target 'src/r63_search_icon.h', needed by 'out/platform/vita.o'`. That was a dry run. The Vita compiler was not invoked, and no object file was produced. `bash -n link.sh` accepted the link script. `arm-vita-eabi-gcc` is not on this machine, and `units.mk` still calls `/usr/local/vitasdk/bin/arm-vita-eabi-gcc`. A path check of `units.mk` found 162 in-repo inputs. Three of those are generated headers and are absent on purpose: `src/vita_map_aperture.generated.h`, `src/r27_cursor_images.h`, and `src/r63_search_icon.h`. `src/ui474.c` also includes `src/runner_icon.generated.h` and `src/custom_run_stone.generated.h`, which the makefile does not list as its own prerequisites. All five stay out because they embed artwork.
 
 ## Libraries and headers that are not in the clone
 
