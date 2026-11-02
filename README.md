@@ -118,7 +118,7 @@ The two tracks stay separate:
 
 ## Before publication
 
-The pre-publication review is [docs/PUBLICATION.md](docs/PUBLICATION.md). This branch has not been pushed. The published fork on `main` is still unmodified Client3, including the inherited `rom/` tree.
+The pre-publication review is [docs/PUBLICATION.md](docs/PUBLICATION.md). The Client3 files that still need a redistribution grant are listed in [docs/CLIENT3-REDISTRIBUTION.md](docs/CLIENT3-REDISTRIBUTION.md). The Vita build inputs are listed in [docs/BUILD-DEPS.md](docs/BUILD-DEPS.md). This branch has not been pushed. Public `main` is still unmodified Client3, so it still contains `rom/cache` and `rom/SCC1_Florestan.sf2`. This branch does not.
 
 ## Credits
 

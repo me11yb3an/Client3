@@ -1,6 +1,8 @@
 # Publication checklist
 
-Date: 2 November 2026. Branch `migration/vita-build-244` at the review that produced this note. Nothing in this checklist was pushed. No upstream file was deleted. History was not rewritten.
+Date: 2 November 2026. The local branch `migration/vita-build-244` now also has an asset-free patch on top of the review. Nothing in this checklist was pushed. Public `main` is still `53c4cf8`. History was not rewritten.
+
+The asset-free patch removes `rom/cache/` and `rom/SCC1_Florestan.sf2` from this branch only. Those files remain on `main` and in the parent commits of this branch. `rom/Roboto/NOTICE` names Google as the copyright holder. `rom/config.ini` has an empty password on this branch. The previous password remains in `53c4cf8`.
 
 Working source on this branch is revision 225, build 244. Revision 377 is not in this tree and is not part of this checklist.
 
@@ -47,10 +49,10 @@ These five headers embed pixels and are absent on purpose. Do not regenerate the
 
 | Path | Contents | License finding | Recommendation |
 | --- | --- | --- | --- |
-| `rom/Roboto/` | 12 `Roboto-*.ttf` files. The name tables contain Roboto, Google, and Apache. `LICENSE.txt` is the Apache-2.0 text. Its appendix still has the blank sample copyright line. | Apache-2.0 is the appropriate license for Google Roboto. The appendix does not name the copyright holder. | Keep the fonts. Add a short notice that names Google as the copyright holder. That notice is not in the tree yet. |
-| `rom/SCC1_Florestan.sf2` | Internal name `Florestan Basic GM GS`, with the historical Florestan URLs. | Musical Artifacts labels the bank public domain. The bank is sampled from a Roland Sound Canvas. A 2026 derivative says those samples are Microsoft GS wavetable data and that Roland's Sound Canvas set is licensed for Microsoft operating-system products unless Roland grants another license. The public-domain label is not settled. | Do not describe this file as cleared. Leave it until you choose a replacement bank with a license you can show. |
-| `rom/cache/` | Cache archives (`config`, `media`, `models`, `textures`, `title`, `interface`, `sounds`, `wordenc`), 828 map files, 182 files in `songs/`, 48 files in `jingles/`, and `mapview/worldmap.jag`. The MIDI names are RuneScape track names. | No license was found. These are game assets. | Do not treat them as licensed for this project. |
-| `rom/config.ini` | Client options, including a remembered username and password. | Not a copyright license. It is a credential in a public file. | Replace the password with an empty placeholder before relying on this tree as the public copy. The current value remains in Client3 history and in this fork's `main`. |
+| `rom/Roboto/` | 12 `Roboto-*.ttf` files. The name table of `Roboto-Regular.ttf` says Copyright 2011 Google Inc. `LICENSE.txt` is Apache-2.0. | Apache-2.0 applies to these fonts. | Kept. `rom/Roboto/NOTICE` supplies the copyright line the license appendix left blank. |
+| `rom/SCC1_Florestan.sf2` | Florestan Basic GM GS, sampled from a Roland Sound Canvas. | The public-domain label is not settled. | Removed from this branch. The blob remains on `main` and in history. |
+| `rom/cache/` | Cache archives, 828 map files, 182 songs, 48 jingles, and `worldmap.jag`. | No license was found. | Removed from this branch. The blobs remain on `main` and in history. |
+| `rom/config.ini` | Client options. Upstream stored a username and a password. | The password is a 9-letter token next to the username `shared`. It is the value Client3 already publishes, not a newly found private key. It is still a login password, so this branch stores an empty value. | Cleared on this branch. The old value remains in `53c4cf8`. |
 
 ## What a GitHub fork authorizes
 
@@ -64,10 +66,7 @@ Section D.3 still requires the person who posts content to have the right to pos
 
 ## Decisions required before publishing the Vita branch
 
-1. Obtain a license or a written grant covering the Client3 files this branch copies and modifies, or accept that the branch stays unpublished.
-2. Choose what to do with inherited `rom/cache`, the 230 MIDI files, and `worldmap.jag`. Leaving them keeps the faithful fork. Removing them takes a separate approved commit, and the blobs remain reachable from `main` and from upstream history. A fork cannot be made private by itself. A history rewrite was not done and is not proposed here.
-3. Choose whether `rom/SCC1_Florestan.sf2` stays as inherited upstream material or is later replaced by a bank with a license you can show.
-4. Approve a short Google copyright notice beside `rom/Roboto/`.
-5. Approve clearing the remembered password in `rom/config.ini`.
-6. Decide how the five image headers and `rom/vita-enhanced.bin` will be supplied on the build machine. Do not commit extracted game art to fill those gaps.
-7. Say explicitly when `migration/vita-build-244` may be pushed. Until then it stays local.
+1. Obtain a license or a written grant covering the files in [CLIENT3-REDISTRIBUTION.md](CLIENT3-REDISTRIBUTION.md), or leave this branch unpublished.
+2. The cache, music, maps, and Florestan soundfont are gone from this branch and still present on public `main`. Removing them from `main` needs a separate approval. A history rewrite was not done.
+3. Decide how the five image headers and `rom/vita-enhanced.bin` will be supplied on the build machine. The steps are in [BUILD-DEPS.md](BUILD-DEPS.md).
+4. Say explicitly when `migration/vita-build-244` may be pushed. Until then it stays local.

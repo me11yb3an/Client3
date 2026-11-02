@@ -27,6 +27,10 @@ This file was written for the source export and then updated for the Client3 for
 | Whole-bundle commit | Only `Environment.ts` was pinned to `e1dea19f`. Local `embedded/` and Barrows modules mean the bundles are not an upstream release tarball. | A recorded build recipe naming that commit plus the local patches. The bundle bytes were not rewritten. |
 | node-forge package version | The bundles vendor node-forge without a version string. The notice uses the upstream BSD text current on 2 November 2026. | The package version from the machine that ran esbuild, if it is still known. |
 
+## Local asset-free patch
+
+A later commit on `migration/vita-build-244` removes `rom/cache/` and `rom/SCC1_Florestan.sf2` from that branch, adds `rom/Roboto/NOTICE`, and stores an empty password in `rom/config.ini`. Public `main` and Client3 history are unchanged. The files that still need a Client3 grant are listed in `docs/CLIENT3-REDISTRIBUTION.md`. The build inputs that are still missing are listed in `docs/BUILD-DEPS.md`.
+
 ## Confirmed permissions
 
 None. The README credits conversations and reference repositories. Those notes are not a license and not a written grant. `rsc-c-vita` being AGPL-3.0 would be a permission with conditions if its code had been copied. No copied code was found, so that license is not being accepted for this tree and is not being rejected as a future obligation if a copy turns up later.
